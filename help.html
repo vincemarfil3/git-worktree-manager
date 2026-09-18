@@ -1,0 +1,232 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Help — Worktree manager</title>
+    <style>
+      :root {
+        --bg: #1b1b1f; --bg2: #252529; --bg3: #303039; --line: #34343c;
+        --txt: #ececf1; --sub: #9a9aa6; --accent: #4f8cff; --accent2: #3f73d6; --green: #3aab57;
+      }
+      * { box-sizing: border-box; }
+      body { font: 14px/1.5 system-ui, "Segoe UI", sans-serif; margin: 0; color: var(--txt);
+        background: var(--bg); -webkit-font-smoothing: antialiased; }
+      .wrap { max-width: 660px; margin: 0 auto; padding: 28px 20px 60px; }
+      header { display: flex; align-items: center; gap: 11px; margin-bottom: 6px; }
+      .logo { width: 26px; height: 26px; border-radius: 7px; background: linear-gradient(135deg, #4f8cff, #a65cd6); flex: 0 0 auto; }
+      h1 { font-size: 18px; margin: 0; font-weight: 650; }
+      .lead { color: var(--sub); margin: 0 0 22px; font-size: 13px; }
+
+      .card { background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; margin-bottom: 18px; }
+      .card h2 { font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--sub); margin: 0 0 12px; font-weight: 600; }
+
+      .source { display: flex; align-items: center; gap: 9px; font-size: 13px; flex-wrap: wrap; }
+      .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+      .pill.gen { background: rgba(58, 171, 87, .16); color: #5fd07e; }
+      .pill.err { background: rgba(229, 83, 75, .16); color: #ef7c76; }
+
+      .note { color: var(--sub); font-size: 12.5px; margin: 0 0 10px; }
+      .note:last-child { margin-bottom: 0; }
+      .note code { background: var(--bg3); padding: 1px 5px; border-radius: 4px; color: #d6d6dd; }
+      .note b { color: var(--txt); }
+      ol.steps { padding-left: 20px; margin: 0; }
+      ol.steps > li { margin: 0 0 14px; color: var(--txt); font-size: 13px; line-height: 1.55; }
+      ol.steps > li:last-child { margin-bottom: 0; }
+      ol.steps > li .note { margin-top: 4px; }
+
+      .cmd-row { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+      .cmd { flex: 1; min-width: 0; background: var(--bg); border: 1px solid var(--line); border-radius: 7px;
+        color: #d6d6dd; font: 12px ui-monospace, Consolas, monospace; padding: 8px 10px; overflow-x: auto;
+        white-space: pre; }
+      button { padding: 7px 12px; border-radius: 7px; border: 0; cursor: pointer; font: 600 12px system-ui;
+        background: var(--bg3); color: var(--txt); border: 1px solid var(--line); white-space: nowrap; }
+      button:hover { background: var(--line); }
+      button.primary { background: var(--accent); color: #fff; border: 0; }
+      button.primary:hover { background: var(--accent2); }
+      .copymsg { font-size: 11.5px; color: var(--green); margin-left: 4px; }
+
+      details { background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; padding: 4px 18px; margin-bottom: 18px; }
+      summary { cursor: pointer; padding: 12px 0; font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--sub); font-weight: 600; list-style: none; }
+      summary::-webkit-details-marker { display: none; }
+      summary::before { content: "▸ "; }
+      details[open] summary::before { content: "▾ "; }
+      details .inner { padding-bottom: 14px; }
+
+      dl.faq dt { font-weight: 600; font-size: 13px; margin: 14px 0 3px; }
+      dl.faq dt:first-child { margin-top: 0; }
+      dl.faq dd { margin: 0; color: var(--sub); font-size: 12.5px; line-height: 1.55; }
+      dl.faq dd code { background: var(--bg3); padding: 1px 5px; border-radius: 4px; color: #d6d6dd; }
+
+      a { color: var(--accent); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      .foot { padding: 9px 0 0; font-size: 11.5px; color: var(--sub); }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <span class="logo"></span>
+        <h1>Worktree manager — Help</h1>
+      </header>
+      <p class="lead">A plain-language walkthrough for installing this extension and getting it
+        connected — for the day-to-day feature list, see the popup itself; this page is just setup
+        and troubleshooting.</p>
+
+      <div class="card">
+        <h2>Are you already connected?</h2>
+        <div class="source" id="liveStatus">Checking…</div>
+      </div>
+
+      <div class="card">
+        <h2>What this extension actually needs</h2>
+        <p class="note">Chrome extensions are sandboxed — they're not allowed to run programs, read
+          your files, or use git, on purpose, as a security boundary. So the popup you see is only
+          half of this tool: the other half is a small helper program that runs on <b>your own
+          computer</b> (not Chrome's), which the popup talks to whenever it needs to actually touch
+          git or edit <code>stories.json</code>. Everything below is about getting that helper —
+          called the <b>native host</b> — installed and connected. Until it is, the popup can still
+          group tabs, but buttons like <b>+ New story</b> and <b>🗑</b> won't work.</p>
+      </div>
+
+      <div class="card">
+        <h2>First-time setup</h2>
+        <ol class="steps">
+          <li><b>Load the extension.</b> Open <code>chrome://extensions</code>, turn on
+            <b>Developer mode</b> (top-right toggle), click <b>Load unpacked</b>, and pick this
+            <code>story-tab-groups</code> folder.
+            <div class="note">Pin it to the toolbar while you're there (the puzzle-piece icon →
+              the pin next to "Worktree manager") so it's always one click away.</div>
+          </li>
+          <li><b>Run the setup script.</b> This needs a terminal open <i>in the same folder you
+            just picked</i> — in File Explorer, open that <code>story-tab-groups</code> folder,
+            then either:
+            <div class="note" style="margin: 6px 0">
+              <b>•</b> click into the address bar at the top, type <code>powershell</code>, and
+              press Enter — <b>or</b><br/>
+              <b>•</b> hold <b>Shift</b> and right-click inside the folder (on empty space, not a
+              file), then choose <b>Open PowerShell window here</b> (Windows 11: <b>Open in
+              Terminal</b>).
+            </div>
+            Once a terminal window opens with that folder already selected, run:
+            <div class="cmd-row">
+              <code class="cmd">.\setup.ps1</code>
+              <button data-copy=".\setup.ps1" data-copymsg="setupCopyMsg">Copy</button>
+              <span class="copymsg" id="setupCopyMsg"></span>
+            </div>
+            <div class="note">This one command connects the native host, looks for your
+              <code>stories.json</code> (and asks you where it is if it can't find it
+              automatically), and runs a health check that tells you exactly what's missing if
+              anything is. It's safe to run again any time — it only asks before changing
+              anything that isn't a brand-new setup.</div>
+          </li>
+          <li><b>Fully restart the browser.</b> Close <i>every</i> Chrome window, not just this
+            tab and not just a reload of the extension — the native host is only re-read when the
+            browser cold-starts.
+          </li>
+          <li><b>Confirm it worked.</b> Reopen the popup → <b>Settings</b> → the <b>Native host</b>
+            card should show <span class="pill gen">✓ connected</span>. The status card at the top
+            of this page checks the same thing live.
+          </li>
+        </ol>
+      </div>
+
+      <div class="card">
+        <h2>Moving to a new computer, or replacing an existing install</h2>
+        <p class="note"><b>Already have an older copy installed here?</b> Use <i>this</i> section
+          instead of First-time setup above, not after it — the command below is the exact same
+          <code>setup.ps1</code>, just with one extra flag that also migrates the old install, so
+          it does everything the plain version does <i>plus</i> the migration, in one run.</p>
+        <p class="note">Copying this folder to a machine that already has an older copy needs one
+          extra bit of care: Chrome has no way for one extension to remove another, so an old and
+          new copy left loaded side by side will both try to manage the same tab groups. Your data
+          (<code>stories.json</code>) is never at risk either way — this is purely about avoiding
+          two copies of the popup fighting each other.</p>
+        <ol class="steps">
+          <li>Load the new folder unpacked, same as step 1 above.</li>
+          <li>Go to <code>chrome://extensions</code> and <b>remove or disable the old
+            "Worktree manager" entry</b> — there'll be two listed once both are loaded.</li>
+          <li>From the new folder, run (with the old folder's real path in place of the
+            placeholder):
+            <div class="cmd-row">
+              <code class="cmd" id="migrateCmd">.\setup.ps1 -OldExtensionDir "&lt;old story-tab-groups folder&gt;"</code>
+              <button data-copy='.\setup.ps1 -OldExtensionDir "&lt;old story-tab-groups folder&gt;"' data-copymsg="migrateCopyMsg">Copy</button>
+              <span class="copymsg" id="migrateCopyMsg"></span>
+            </div>
+            <div class="note">This carries over the old install's configured root, retires its old
+              scripts (renamed, never deleted), re-points any scheduled EOD reminders, and
+              unregisters the old native host — all in one pass, and it asks before each step
+              unless you add <code>-Force</code>. Add <code>-WhatIf</code> first if you want to see
+              exactly what it would do without changing anything.</div>
+          </li>
+          <li>Fully restart the browser.</li>
+          <li>Confirm it worked — same check as First-time setup's step 4: popup → <b>Settings</b>
+            → <b>Native host</b> should show <span class="pill gen">✓ connected</span>.</li>
+        </ol>
+      </div>
+
+      <details>
+        <summary>Advanced — install the native host without setup.ps1</summary>
+        <div class="inner">
+          <p class="note">If you'd rather just register the bridge and handle everything else
+            (finding your <code>stories.json</code>, etc.) by hand, or <code>setup.ps1</code>
+            couldn't auto-detect this extension's id:</p>
+          <div class="cmd-row">
+            <code class="cmd" id="manualCmd">cd native-host<br/>.\install-native-host.ps1 -ExtensionId …</code>
+            <button id="manualCopyBtn">Copy</button>
+            <span class="copymsg" id="manualCopyMsg"></span>
+          </div>
+          <p class="note" id="manualIdNote"></p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Troubleshooting</summary>
+        <div class="inner">
+          <dl class="faq">
+            <dt>Settings shows "✕ not connected"</dt>
+            <dd>Run <code>.\setup.ps1</code> again from the extension folder, then fully restart
+              the browser (every window). If that doesn't clear it, use the exact command Settings
+              shows you — it has your extension's real id filled in already.</dd>
+
+            <dt>It was working, then I removed and re-added the extension in Chrome</dt>
+            <dd>Removing and re-adding (not just toggling Off/On) gives the extension a brand new
+              id, which the native host no longer recognizes. Re-run <code>.\setup.ps1</code> (or
+              the Advanced command above) and restart the browser.</dd>
+
+            <dt>My stories aren't showing up in the popup</dt>
+            <dd>Open <b>Settings</b> → <b>Worktree paths &amp; branch format</b> and check the
+              <b>Story root</b> field — it needs to point at the folder your
+              <code>stories.json</code> actually lives in. The <b>Paths &amp; diagnostics</b> card
+              right above it shows exactly what's currently configured and where each value came
+              from.</dd>
+
+            <dt>I ran setup.ps1 (or changed Root) while Chrome was already open, and it's still using the old location</dt>
+            <dd>Fully quit Chrome — every window, confirmed via Task Manager that no
+              <code>chrome.exe</code> is left running — then reopen it. This is different from
+              reloading the extension: the native host runs as a child of the browser process
+              itself, and it inherits whatever was true when <i>that browser</i> started, not
+              whatever is true right now. An already-open browser can keep using a stale root long
+              after Settings (and <code>Paths &amp; diagnostics</code>) correctly show the new one —
+              closing every window and reopening is the only way to clear that.</dd>
+
+            <dt>I see an error like "returned no JSON" or "host error"</dt>
+            <dd>This means the native host ran but something inside it failed. Settings' <b>Paths
+              &amp; diagnostics</b> card re-runs the same checks <code>setup.ps1</code> does and
+              will usually name the exact problem (a missing script, an unreadable
+              <code>stories.json</code>, git not on PATH, …).</dd>
+
+            <dt>I moved the whole extension folder somewhere else</dt>
+            <dd>That's fine on its own — the extension finds its own scripts relative to itself,
+              and moving files doesn't change its id. You only need to re-run the installer if you
+              also removed and re-added the extension in Chrome (see above).</dd>
+          </dl>
+        </div>
+      </details>
+
+      <p class="foot">Editing the scripts yourself, or curious how any of this actually works?
+        <code>native-host\README.md</code> and <code>CLAUDE.md</code> in this folder are the
+        deeper technical reference this page intentionally doesn't repeat.</p>
+    </div>
+    <script src="help.js"></script>
+  </body>
+</html>

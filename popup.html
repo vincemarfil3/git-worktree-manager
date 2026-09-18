@@ -1,0 +1,253 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root {
+        --bg: #1b1b1f; --bg2: #252529; --bg3: #303039; --line: #34343c;
+        --txt: #ececf1; --sub: #9a9aa6; --accent: #4f8cff; --accent2: #3f73d6;
+      }
+      * { box-sizing: border-box; }
+      body { font: 13px/1.45 system-ui, "Segoe UI", sans-serif; margin: 0; width: 328px; color: var(--txt);
+        background: var(--bg); -webkit-font-smoothing: antialiased; }
+      header { display: flex; align-items: center; gap: 9px; padding: 13px 14px 9px; }
+      .logo { width: 18px; height: 18px; border-radius: 5px; background: linear-gradient(135deg, #4f8cff, #a65cd6); flex: 0 0 auto; }
+      header h1 { font-size: 13px; font-weight: 600; margin: 0; letter-spacing: .01em; }
+
+      .controls { padding: 0 14px; display: flex; flex-direction: column; gap: 8px; }
+      .field { display: flex; gap: 7px; align-items: center; }
+
+      .btn { border: 0; border-radius: 7px; padding: 6px 11px; font: 600 12px system-ui; cursor: pointer;
+        background: var(--accent); color: #fff; white-space: nowrap; transition: background .12s; }
+      .btn:hover { background: var(--accent2); }
+      .btn.ghost { background: var(--bg2); color: var(--txt); border: 1px solid var(--line); font-weight: 500; }
+      .btn.ghost:hover { background: var(--bg3); }
+      .btn.sm { padding: 6px 6px; font-size: 11px; }
+      .btn:disabled { opacity: .4; cursor: default; background: var(--bg2); color: var(--sub); border: 1px solid var(--line); }
+
+      hr { border: 0; border-top: 1px solid var(--line); margin: 4px 0 2px; }
+      .status { font-size: 11.5px; color: var(--sub); padding: 1px 2px; }
+      .status.on { color: #8fd6a3; }
+      .status b { color: var(--txt); font-weight: 600; }
+
+      .section-row { display: flex; align-items: center; justify-content: space-between; padding: 13px 12px 3px 14px; }
+      .section-lbl { font-size: 9px; letter-spacing: .09em; text-transform: uppercase; color: var(--sub); }
+      .loadbtn { border: 1px solid var(--line); background: var(--bg2); color: var(--sub); border-radius: 6px;
+        padding: 3px 8px; font: 600 10px system-ui; letter-spacing: .04em; cursor: pointer; }
+      .loadbtn:hover { background: var(--bg3); color: var(--txt); }
+      .loadbtn:disabled { opacity: .6; cursor: default; }
+
+      .stories { padding: 0 8px 4px; }
+      /* A row is now a small card: header line + optional metadata line + optional health line. */
+      .story { display: flex; flex-direction: column; gap: 4px; padding: 7px 8px; border-radius: 8px; cursor: pointer;
+        border: 1px solid transparent; }
+      .srow { display: flex; align-items: center; gap: 9px; }
+      .story:hover { background: var(--bg2); }
+      .story.act { box-shadow: inset 3px 0 0 var(--accent); }
+      .story.sel { border-color: var(--accent); background: rgba(79, 140, 255, .13); }
+      .story.sel:hover { background: rgba(79, 140, 255, .18); }
+      .dot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; box-shadow: 0 0 0 3px rgba(255, 255, 255, .04); }
+      .dot.off { opacity: .28; box-shadow: none; }
+      .stitle { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+      .acttag { font: 700 8px system-ui; letter-spacing: .07em; text-transform: uppercase; color: #fff; background: var(--accent);
+        border-radius: 4px; padding: 2px 5px; flex: 0 0 auto; }
+      .count { min-width: 18px; height: 18px; padding: 0 5px; flex: 0 0 auto; display: inline-flex; align-items: center;
+        justify-content: center; font: 600 10px system-ui; border-radius: 9px; background: var(--bg3); color: var(--sub); }
+      .ico { width: 24px; height: 24px; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+        border: 0; border-radius: 6px; background: transparent; color: var(--sub); font-size: 14px; line-height: 1; cursor: pointer;
+        transition: background .12s, color .12s; }
+      .ico:hover { background: var(--bg3); color: var(--txt); }
+      .ico.off { opacity: .3; }
+      .ico.danger { font-size: 12px; opacity: .55; }
+      .ico.danger:hover { background: rgba(229, 83, 75, .16); color: #e5534b; opacity: 1; }
+      .ico.confirm { color: #3aab57; opacity: 1; }
+      .ico.confirm:hover { background: rgba(58, 171, 87, .2); }
+      .ico.cancel:hover { background: var(--bg3); color: var(--txt); }
+      .ico.recycle { font-size: 13px; color: #d8a800; opacity: .7; }
+      .ico.recycle:hover { background: rgba(216, 168, 0, .16); color: #d8a800; opacity: 1; }
+      /* ✎ links editor toggle — same "lit while armed" treatment as .ico.rocket.on / .bolt.busy */
+      .ico.on { opacity: 1; color: var(--accent); background: rgba(79, 140, 255, .14); }
+
+      /* Typed-CONFIRM force-remove (a blocked story's 🗑 arms this instead of the quick ✓/✕) */
+      .sforce { padding: 6px 8px 2px 18px; display: flex; flex-direction: column; gap: 6px; }
+      .sforce-warn { font-size: 10.5px; line-height: 1.4; color: #d8a800; }
+      .sforce-row { display: flex; gap: 6px; align-items: center; }
+      .sforce-input { flex: 1; min-width: 0; background: var(--bg3); border: 1px solid var(--line); border-radius: 6px;
+        color: var(--txt); font: 11.5px ui-monospace, Consolas, monospace; padding: 5px 8px; }
+      .sforce-input::placeholder { color: var(--sub); }
+      .btn.danger { background: #e5534b; color: #fff; }
+      .btn.danger:hover:not(:disabled) { background: #c94840; }
+      /* Explicit + higher-specificity than plain .btn.danger or the generic .btn:disabled, so the
+         grey disabled look always wins regardless of stylesheet order - see the [hidden] gotcha in
+         CLAUDE.md for why an implicit tie here would be worth double-checking instead of assuming. */
+      .btn.danger:disabled { opacity: .4; cursor: not-allowed; background: var(--bg2); color: var(--sub); border: 1px solid var(--line); }
+
+      /* ✎ custom-links editor (a row's ✎ arms this — add/edit/remove named links) */
+      .slinks { padding: 6px 8px 4px 18px; display: flex; flex-direction: column; gap: 6px; }
+      .slinks-row { display: flex; gap: 6px; align-items: center; }
+      .slinks-label, .slinks-url { background: var(--bg3); border: 1px solid var(--line); border-radius: 6px;
+        color: var(--txt); font: 11.5px ui-monospace, Consolas, monospace; padding: 5px 7px; min-width: 0; }
+      .slinks-label { flex: 0 0 84px; }
+      .slinks-url { flex: 1; }
+      .slinks-label::placeholder, .slinks-url::placeholder { color: var(--sub); }
+      .slinks-add { font-size: 11px; color: var(--accent); cursor: pointer; padding: 2px 0; user-select: none; }
+      .slinks-add:hover { text-decoration: underline; }
+      .slinks-err { font-size: 10.5px; line-height: 1.4; color: #e5534b; }
+      .slinks-btns { display: flex; gap: 6px; margin-top: 2px; }
+
+      /* ready / blocked badge driven by remove-worktree.ps1 -CheckAll */
+      .rmstat { font: 700 8px system-ui; letter-spacing: .06em; text-transform: uppercase; padding: 2px 5px;
+        border-radius: 4px; flex: 0 0 auto; white-space: nowrap; cursor: help; }
+      .rmstat.ok { color: #8fd6a3; background: rgba(143, 214, 163, .13); }
+      .rmstat.warn { color: #d8a800; background: rgba(216, 168, 0, .14); }
+
+      /* metadata + lifecycle chips (second line of a row) */
+      .smeta { display: flex; flex-wrap: wrap; gap: 4px; padding-left: 18px; }
+      .chip { font: 600 9px system-ui; letter-spacing: .03em; padding: 2px 5px; border-radius: 4px;
+        background: var(--bg3); color: var(--sub); white-space: nowrap; flex: 0 0 auto; }
+      a.chip.link { color: var(--accent); text-decoration: none; }
+      a.chip.link:hover { background: rgba(79, 140, 255, .18); text-decoration: none; }
+      .chip.phase { cursor: help; }
+      .chip.phase.ok { color: #8fd6a3; background: rgba(143, 214, 163, .13); }
+      .chip.phase.run { color: #4f8cff; background: rgba(79, 140, 255, .15); }
+      .chip.phase.bad { color: #e5534b; background: rgba(229, 83, 75, .15); }
+
+      /* on-demand ports + health (third line, only after ⚡) */
+      .shealth { padding-left: 18px; font: 10.5px/1.5 ui-monospace, Consolas, monospace; color: var(--sub); }
+      .shealth .bad, .shealth.bad { color: #e5534b; }
+      .chip.rel { color: #8fd6a3; background: rgba(143, 214, 163, .16); cursor: help; }
+      .ico.rocket { font-size: 12px; opacity: .5; }
+      .ico.rocket:hover { background: rgba(143, 214, 163, .16); opacity: 1; }
+      .ico.rocket.on { opacity: 1; }
+      .ico.bolt { font-size: 12px; opacity: .55; }
+      .ico.bolt:hover { background: rgba(79, 140, 255, .16); color: var(--accent); opacity: 1; }
+      .ico.bolt.busy { opacity: 1; color: var(--accent); }
+
+      /* story-doctor banner */
+      .docmsg { padding: 6px 14px 0; font-size: 11px; line-height: 1.4; cursor: help; }
+      .docmsg:empty { display: none; }
+      .docmsg.warn { color: #d8a800; }
+      .docmsg.err { color: #e5534b; }
+
+      .rmmsg { padding: 7px 14px 0; font-size: 11.5px; line-height: 1.4; color: var(--sub); }
+      .rmmsg:empty { display: none; }
+      .rmmsg.ok { color: #8fd6a3; }
+      .rmmsg.warn { color: #d8a800; }
+      .rmmsg.err { color: #e5534b; }
+
+      /* + New story (inline form, no native dialogs - same reason removal/release use one) */
+      .addform { margin: 4px 14px 8px; padding: 10px 10px 9px; border: 1px solid var(--line); border-radius: 8px;
+        background: var(--bg2); display: flex; flex-direction: column; gap: 7px; }
+      .afinput { flex: 1; min-width: 0; background: var(--bg3); border: 1px solid var(--line); border-radius: 6px;
+        color: var(--txt); font: 12px system-ui; padding: 6px 8px; }
+      .afinput::placeholder { color: var(--sub); }
+      .afapps-hdr { font-size: 11.5px; color: var(--sub); cursor: pointer; padding: 2px 0;
+        user-select: none; }
+      .afapps-hdr:hover { color: var(--txt); }
+      .afapps-body { display: flex; flex-direction: column; gap: 5px; }
+      /* Both rules above set 'display' at the same specificity as the browser's own [hidden] rule,
+         so on a tie the LATER stylesheet (this one) wins the cascade and the hidden attribute has
+         no visible effect at all - this is what let #addForm render unconditionally regardless of
+         its hidden state. Restate 'none' at higher specificity (class + attribute) so [hidden]
+         always wins over the layout rule once it's actually set. */
+      .addform[hidden], .afapps-body[hidden], .field[hidden] { display: none; }
+      .afinput:disabled { opacity: .6; cursor: default; }
+      .afapps { display: flex; flex-direction: column; gap: 3px; max-height: 118px; overflow-y: auto;
+        padding: 5px 2px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+      .afapprow { display: flex; align-items: center; gap: 6px; font-size: 11.5px; cursor: pointer; }
+      .afapprow.disabled { opacity: .45; cursor: default; }
+      .afflag { font-size: 9px; color: var(--sub); }
+      .afflag.warn { color: #d8a800; }
+      .afhint { font-size: 11px; color: var(--sub); padding: 2px 0; }
+      .afcheck { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--sub); cursor: pointer; }
+      .afresult { font-size: 11px; line-height: 1.55; color: var(--sub); }
+      .afresult:empty { display: none; }
+      .afresult .aferr { color: #e5534b; }
+      .afresult .afwarn { color: #d8a800; }
+      .afresult .afok { color: #8fd6a3; }
+
+      .foot { padding: 9px 14px 12px; font-size: 11px; color: var(--sub); border-top: 1px solid var(--line); margin-top: 4px; }
+      a { color: var(--accent); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <span class="logo"></span>
+      <h1>Worktree manager</h1>
+    </header>
+
+    <div id="mainView">
+      <div class="controls">
+        <div class="field">
+          <button class="btn sm" id="addStoryBtn" style="flex: 1" title="Create a new story: registers stories.json + cuts a git worktree per app">+ New story</button>
+        </div>
+        <div class="field">
+          <button class="btn ghost sm" id="openLinks" style="flex: 1" title="Open the selected story's Jira / REL / AgileTest / Actions / custom links">↗ Open all</button>
+          <button class="btn ghost sm" id="openWorkspaceBtn" style="flex: 1" title="Write/refresh the selected story's .code-workspace from its current worktrees and open it in VS Code">📂 Open workspace</button>
+        </div>
+        <div class="field">
+          <button class="btn ghost sm" id="addAppBtn" style="flex: 1" title="Add another app to the selected story (cuts its worktree on the story's existing branch)">+ Add app</button>
+        </div>
+
+        <hr />
+        <div class="field">
+          <button class="btn sm" id="setActive" style="flex: 1" title="Make the selected story the active one (turns auto-route on)">★ Set active</button>
+          <button class="btn ghost sm" id="clearActive" style="flex: 1" title="Clear the active story (turns auto-route off)">Clear active</button>
+        </div>
+        <div class="status" id="activeStatus">Auto-route off</div>
+      </div>
+
+      <div class="section-row">
+        <span class="section-lbl" id="sectionLbl">Story groups</span>
+        <button class="loadbtn" id="loadFile" title="Re-read the remembered stories.json and refresh the list">⟳ Load stories.json</button>
+      </div>
+      <div class="stories" id="stories"></div>
+      <div class="docmsg" id="docMsg"></div>
+    </div>
+
+    <!-- Its own full-panel view (not shown alongside the list) - a long app checklist would flood
+         a 328px popup if it sat inline above the stories. -->
+    <div class="addform" id="addForm" hidden>
+      <div class="section-lbl" id="afTitleLbl" style="padding-bottom: 2px">+ New story</div>
+      <div class="afhint" id="afMode" hidden></div>
+      <div class="field"><input class="afinput" id="afJira" placeholder="Jira URL (optional) — auto-fills the key" /></div>
+      <div class="field">
+        <input class="afinput" id="afKey" style="flex: 1.4" placeholder="KEY (EH7-9931 or kebab-slug)" />
+        <input class="afinput" id="afEnv" style="width: 64px" placeholder="env" />
+      </div>
+      <div class="field"><input class="afinput" id="afBranch" placeholder="branch (auto-fills, editable)" /></div>
+      <div class="field"><input class="afinput" id="afTitle" placeholder="title (optional — not fetched from Jira)" /></div>
+      <div class="afapps-hdr" id="afAppsHdr">
+        <span id="afAppsSummary">Select apps ▸</span>
+      </div>
+      <div class="afapps-body" id="afAppsBody" hidden>
+        <input class="afinput" id="afAppsSearch" placeholder="filter apps…" />
+        <div class="afapps" id="afApps"></div>
+      </div>
+      <label class="afcheck"><input type="checkbox" id="afOpen" checked /> open in VS Code when done</label>
+      <div class="afresult" id="afResult"></div>
+      <div class="field" id="afButtons">
+        <button class="btn sm" id="afCheck" style="flex: 1">Check &amp; create</button>
+        <button class="btn ghost sm" id="afCancel" style="flex: 1">Cancel</button>
+      </div>
+    </div>
+
+    <!-- Suggestions for the ✎ links editor's label field — free typing still works, this is a
+         datalist, not a restrictive <select>. -->
+    <datalist id="linkLabelSuggestions">
+      <option value="Abstract"></option>
+      <option value="Test Plan"></option>
+      <option value="Design Doc"></option>
+      <option value="Runbook"></option>
+      <option value="Confluence"></option>
+    </datalist>
+
+    <div class="rmmsg" id="rmMsg"></div>
+
+    <div class="foot">Click a story to select · <b>Set active</b> drives auto-route · right-click any page/link → <b>Add to story group</b>. <a href="#" id="hist">History</a> · <a href="#" id="help">Help</a> · <a href="#" id="opt">Settings</a></div>
+    <script src="rules-core.js"></script>
+    <script src="rules-lib.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

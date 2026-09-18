@@ -1,0 +1,84 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Story History — Worktree manager</title>
+    <style>
+      :root {
+        --bg: #1b1b1f; --bg2: #252529; --bg3: #303039; --line: #34343c;
+        --txt: #ececf1; --sub: #9a9aa6; --accent: #4f8cff; --accent2: #3f73d6;
+      }
+      * { box-sizing: border-box; }
+      body { font: 13.5px/1.5 system-ui, "Segoe UI", sans-serif; margin: 0; color: var(--txt);
+        background: var(--bg); -webkit-font-smoothing: antialiased; }
+      .wrap { max-width: 880px; margin: 0 auto; padding: 22px 22px 60px; }
+
+      header { display: flex; align-items: center; gap: 11px; margin-bottom: 4px; }
+      .logo { width: 22px; height: 22px; border-radius: 6px; background: linear-gradient(135deg, #4f8cff, #a65cd6); flex: 0 0 auto; }
+      header h1 { font-size: 18px; font-weight: 600; margin: 0; letter-spacing: .01em; }
+      .sub { color: var(--sub); font-size: 12.5px; margin: 2px 0 18px 33px; }
+
+      .toolbar { display: flex; gap: 9px; align-items: center; margin-bottom: 18px; }
+      input[type=text] { background: var(--bg2); border: 1px solid var(--line); color: var(--txt);
+        border-radius: 8px; padding: 8px 11px; font: 13px system-ui; outline: none; flex: 1; min-width: 0; }
+      input[type=text]:focus { border-color: var(--accent); }
+      .btn { border: 1px solid var(--line); background: var(--bg2); color: var(--sub); border-radius: 8px;
+        padding: 7px 12px; font: 600 12px system-ui; cursor: pointer; white-space: nowrap; }
+      .btn:hover { background: var(--bg3); color: var(--txt); }
+      .count { color: var(--sub); font-size: 12px; white-space: nowrap; }
+
+      .msg { color: var(--sub); padding: 30px 4px; font-size: 13.5px; }
+      .msg.err { color: #e5534b; }
+
+      .card { background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-bottom: 13px; }
+      .card-head { display: flex; align-items: flex-start; gap: 11px; }
+      .dot { width: 12px; height: 12px; border-radius: 50%; flex: 0 0 auto; margin-top: 4px; box-shadow: 0 0 0 3px rgba(255,255,255,.05); }
+      .key-row { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+      .key { font-weight: 700; font-size: 14px; letter-spacing: .01em; }
+      .when { color: var(--sub); font-size: 11.5px; }
+      .ctitle { font-size: 13px; color: var(--txt); margin-top: 1px; }
+
+      .meta { display: flex; flex-wrap: wrap; gap: 6px; margin: 11px 0 4px 23px; }
+      .chip { font: 600 10.5px system-ui; letter-spacing: .02em; padding: 3px 8px; border-radius: 6px;
+        background: var(--bg3); color: var(--sub); border: 1px solid var(--line); }
+      .chip.env { color: #8fd6a3; }
+      .chip.app { color: var(--txt); }
+      .chip.removed { color: #8fd6a3; }
+      .chip.absent { color: var(--sub); opacity: .7; }
+      .chip.failed { color: #e5534b; }
+
+      .links { display: flex; flex-wrap: wrap; gap: 14px; margin: 9px 0 2px 23px; font-size: 12.5px; }
+      a { color: var(--accent); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+
+      details.log { margin: 10px 0 0 23px; }
+      details.log > summary { cursor: pointer; color: var(--sub); font-size: 12px; user-select: none; list-style: none; }
+      details.log > summary::-webkit-details-marker { display: none; }
+      details.log > summary::before { content: "▸ "; color: var(--sub); }
+      details.log[open] > summary::before { content: "▾ "; }
+      .logentry { border-left: 2px solid var(--line); padding: 4px 0 4px 11px; margin: 8px 0 0; }
+      .logentry .lts { color: var(--sub); font-size: 11px; }
+      .logentry .ltype { color: var(--accent); font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; margin-left: 6px; }
+      .logentry .lmsg { font-size: 12px; color: var(--txt); margin-top: 2px; white-space: pre-wrap; word-break: break-word; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <span class="logo"></span>
+        <h1>Story History</h1>
+      </header>
+      <div class="sub">Stories removed via the 🗑 worktree teardown — archived from <b>stories_history.json</b>.</div>
+
+      <div class="toolbar">
+        <input type="text" id="q" placeholder="filter by key, title, REL, env…" />
+        <span class="count" id="count"></span>
+        <button class="btn" id="reload">⟳ Reload</button>
+      </div>
+
+      <div id="msg" class="msg">Loading…</div>
+      <div id="list"></div>
+    </div>
+    <script src="history.js"></script>
+  </body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "_readme": "This is a TEMPLATE, not a live config file - it is never read by anything. The real, per-machine config lives OUTSIDE this folder at %LOCALAPPDATA%\\story-tab-groups\\stg-config.json, written by setup.ps1 / the Settings page / stg-paths.psm1's Set-StgConfig. Every field below is optional; omit anything you want left at its default.",
+
+  "root": "C:\\Users\\yourname\\Desktop\\Ganesha",
+  "worktreeRoot": "",
+  "workspaceRoot": "",
+  "branchFormat": "feature/{env}/{key}",
+
+  "jiraBaseUrl": "https://your-org.atlassian.net",
+  "githubOrg": "your-github-org",
+  "repoAliases": { "ganesha-iu-internal-app": "ganesha-ui-internal-app" },
+
+  "taskNamePrefix": "Ganesha EOD status reminder",
+  "owner": "",
+  "userConfigDirName": ".story-tab-groups"
+}

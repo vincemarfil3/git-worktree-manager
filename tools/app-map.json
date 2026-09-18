@@ -1,0 +1,27 @@
+{
+  "_readme": [
+    "Per-app port/start-command/health-check/ingress map, read by story-env.ps1 (R4/R5/R6:",
+    "env pointing, port ownership, health checks) and switch-story.ps1 (unmapped-app warning).",
+    "Ground truth for WHAT apps exist is the disk (switch-story.ps1's 'apps' action scans for",
+    "home-base clones) - this file only maps the ones you want story-env.ps1 to manage.",
+    "An app absent from 'apps' below still works everywhere else; story-env.ps1 just reports it",
+    "'unmapped' (no port/start/health) instead of throwing.",
+    "",
+    "Per-app fields (all optional - add only what a given app needs):",
+    "  port           int    - the port it listens on locally",
+    "  start          string - shell command to launch it (run with cwd = the app's worktree)",
+    "  health         string - health-check path, default '/' if omitted",
+    "  ingressSvc     string - remote ingress service name (only if story-env's env-pointing",
+    "                          / mint-pointing feature applies to your infra)",
+    "  ingressToken   string - remote ingress path/token segment (see ingressSvc)",
+    "  ingressScheme  string - 'https' if omitted",
+    "",
+    "pythonSentinel: the package name story-env.ps1 checks for to decide an app is a Python app",
+    "(default 'fastapi' if omitted).",
+    "",
+    "Example (uncomment / adapt - remove this _readme block once you have real entries):",
+    "  \"apps\": { \"my-web-app\": { \"port\": 3000, \"start\": \"yarn dev\", \"health\": \"/\" } }"
+  ],
+  "pythonSentinel": "fastapi",
+  "apps": {}
+}

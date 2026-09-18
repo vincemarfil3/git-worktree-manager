@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Worktree manager",
+  "version": "1.0.0",
+  "description": "Group Chrome tabs by story (PIII/EH7) — manual picker, right-click menu, and auto-route. Rules generated from stories.json.",
+  "permissions": ["tabs", "tabGroups", "contextMenus", "storage", "nativeMessaging"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Worktree manager",
+    "default_icon": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+  },
+  "icons": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "128": "icons/icon128.png" },
+  "options_page": "options.html"
+}
