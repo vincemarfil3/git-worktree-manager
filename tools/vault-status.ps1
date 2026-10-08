@@ -17,26 +17,31 @@ param(
   [string]$Out,
   [switch]$NoCheck,
   [switch]$Json,
-  [string]$Root  # override (native-host\host.ps1 / a Settings-driven root); blank = auto-resolve
+  [string]$Root,  # override (native-host\host.ps1 / a Settings-driven root); blank = auto-resolve
+  [string]$Project  # resolved project id (native-host\host.ps1); blank = active project / legacy resolution
 )
 
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'stg-paths.psm1') -Force -DisableNameChecking
-$Paths = Resolve-StgPaths -Root $Root
+$Paths = Resolve-StgPaths -Root $Root -Project $Project
 if ($Paths.NeedsSetup) {
   if ($Json) { [Console]::Out.Write((@{ ok = $false; error = $Paths.Error; needsSetup = $true } | ConvertTo-Json -Compress)) }
   else { Write-Host $Paths.Error -ForegroundColor Red }
   exit 0
 }
 $Root = $Paths.Root
+# Tracking mode has no worktrees to blocker-scan at all - force the same skip -NoCheck already
+# produces, rather than teaching the -CheckAll call below its own mode branch.
+if ($Paths.Mode -eq 'tracking') { $NoCheck = $true }
 Import-Module (Join-Path $PSScriptRoot 'StoryLib.psm1') -Force -DisableNameChecking
 
-$LedgerName = '.story-ship-state.json'
+# Mirror of $DefaultPhases' grouping in story-ledger.ps1 - keep the two in sync (same rule
+# popup.js's own PHASE_GROUPS comment states; this copy just never had the comment before).
 $Groups = @(
-  @{ name = 'Story Up';     phases = @('bring-up') }
-  @{ name = 'Dev Loop';     phases = @('plan', 'implement', 'testplan', 'verify', 'typecheck', 'commit-push') }
-  @{ name = 'Prep Release'; phases = @('release-notes', 'rel-ticket', 'agiletest', 'release-branch', 'release-prs', 'chg', 'deploy') }
+  @{ name = 'Story Up'; phases = @('bring-up') }
+  @{ name = 'Dev Loop'; phases = @('plan', 'implement', 'testplan', 'verify', 'typecheck', 'commit-push') }
+  @{ name = 'Release';  phases = @('deploy') }
 )
 $Closed = @('done', 'skipped')
 
@@ -48,8 +53,14 @@ function Get-Glyph([string]$s, [bool]$isNext) {
 $result = [ordered]@{ ok = $true; output = $null; stories = 0; summary = '' }
 
 try {
-  $reg = Read-Registry -Root $Root
-  $keys = @($reg.stories.PSObject.Properties.Name)
+  $reg = Read-Registry -Root $Root -DocsDir $Paths.DocsDir
+  # Get-StgNames, not the bare @($reg.stories.PSObject.Properties.Name) idiom - on an empty {}
+  # registry that expression is $null, and @($null) is a one-element array HOLDING $null. The
+  # Join-Path calls this used to feed degraded harmlessly on that null key, but Get-StgLedgerPath's
+  # -Story is a Mandatory [string] parameter and throws "Cannot bind argument ... because it is an
+  # empty string" on it instead - this surfaced the pre-existing bug as a hard crash on a fresh
+  # install with zero stories (same root cause the 'apps' action's identical comment describes).
+  $keys = Get-StgNames $reg.stories
 
   # One git scan for every story (the same call the extension's badges use).
   $checks = @{}
@@ -58,7 +69,8 @@ try {
     $rw = Join-Path $PSScriptRoot 'remove-worktree.ps1'
     if (Test-Path $rw) {
       try {
-        $raw = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $rw -CheckAll -Root $Root -Json
+        # [string]$Paths.ProjectId - see story-status.ps1's Get-LedgerNext for why the cast matters.
+        $raw = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $rw -CheckAll -Root $Root -Project ([string]$Paths.ProjectId) -Json
         $parsed = ("$raw".Trim() | ConvertFrom-Json)
         if ($parsed -and $parsed.stories) {
           foreach ($p in $parsed.stories.PSObject.Properties) { $checks[$p.Name] = $p.Value }
@@ -79,7 +91,7 @@ try {
   $L += '|---|---|---|---|---|'
   foreach ($k in $keys) {
     $node = $reg.stories.$k
-    $ledPath = Join-Path (Join-Path $Root $k) $LedgerName
+    $ledPath = Get-StgLedgerPath -Paths $Paths -Story $k -Node $node
     $phaseCell = 'no ledger'
     if (Test-Path -LiteralPath $ledPath) {
       $led = $null; try { $led = Read-JsonFile -Path $ledPath } catch { }
@@ -103,7 +115,10 @@ try {
     # released flag exists. The worktree is still on disk; only the reporting changes.
     if ("$($node.released)".Trim()) { $phaseCell = "RELEASED $($node.released)" }
     $ck = $checks[$k]
-    $cleanCell = if ($NoCheck -or $null -eq $ck) { 'not checked' }
+    # '-' for tracking mode (genuinely not applicable - no worktree, no apps concept), distinct
+    # from 'not checked' (-NoCheck was passed, or the scan itself came back empty/failed).
+    $cleanCell = if ($Paths.Mode -eq 'tracking') { '-' }
+                 elseif ($NoCheck -or $null -eq $ck) { 'not checked' }
                  elseif ($ck.ok) { 'ready' }
                  else {
                    $n = 0; foreach ($b in @($ck.blockers)) { $n += @($b.dirty).Count }
@@ -111,7 +126,8 @@ try {
                    $bits = @(); if ($n) { $bits += "$n changed" }; if ($u) { $bits += "$u unpushed" }
                    if ($bits.Count) { $bits -join ', ' } else { 'blocked' }
                  }
-    $L += "| [[$k]] | $($node.env) | $phaseCell | $cleanCell | $((@($node.apps | Where-Object { $_ })) -join ', ') |"
+    $appsCell = if ($Paths.Mode -eq 'tracking') { '-' } else { (@($node.apps | Where-Object { $_ })) -join ', ' }
+    $L += "| [[$k]] | $($node.env) | $phaseCell | $cleanCell | $appsCell |"
   }
   $L += ''
 
@@ -142,7 +158,7 @@ try {
     foreach ($p in @($node.PSObject.Properties | Where-Object { $_.Name -like 'document*' })) { if ($p.Value) { $links += "- Design note ($($p.Name)): $($p.Value)" } }
     if ($links.Count) { $L += $links; $L += '' }
 
-    $ledPath = Join-Path (Join-Path $Root $k) $LedgerName
+    $ledPath = Get-StgLedgerPath -Paths $Paths -Story $k -Node $node
     if (Test-Path -LiteralPath $ledPath) {
       $led = $null; try { $led = Read-JsonFile -Path $ledPath } catch { }
       if ($led) {
@@ -186,7 +202,11 @@ try {
     }
   }
 
-  $notesDir = Join-Path $Root 'notes'
+  # Tracking mode: $Root genuinely IS the tracked repo, so a bare <root>\notes\ folder would be
+  # untracked clutter showing up in that repo's own `git status` - same reasoning as
+  # Get-StgLedgerPath's own tracking-mode branch. Keep it under docsDir instead, consolidated with
+  # every other tracking-mode artifact (stories.json, the per-story docs, ledgers).
+  $notesDir = if ($Paths.Mode -eq 'tracking') { Join-Path (Join-Path $Root $Paths.DocsDir) 'notes' } else { Join-Path $Root 'notes' }
   if (-not (Test-Path -LiteralPath $notesDir)) { [void](New-Item -ItemType Directory -Path $notesDir -Force) }
   $outPath = if ($Out) { $Out } else { Join-Path $notesDir 'worktrees.md' }
   Write-Utf8NoBom -Path $outPath -Text (($L -join "`r`n") + "`r`n")

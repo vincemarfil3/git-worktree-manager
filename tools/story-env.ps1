@@ -51,13 +51,14 @@ param(
   [switch]$Json,
   [switch]$NoStopAll,
   [int]$TimeoutSec = 120,
-  [string]$Root  # override (native-host\host.ps1 / a Settings-driven root); blank = auto-resolve
+  [string]$Root,  # override (native-host\host.ps1 / a Settings-driven root); blank = auto-resolve
+  [string]$Project  # resolved project id (native-host\host.ps1); blank = active project / legacy resolution
 )
 
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'stg-paths.psm1') -Force -DisableNameChecking
-$Paths = Resolve-StgPaths -Root $Root
+$Paths = Resolve-StgPaths -Root $Root -Project $Project
 if ($Paths.NeedsSetup) {
   $o = @{ ok = $false; error = $Paths.Error; needsSetup = $true }
   if ($Json) { [Console]::Out.Write(($o | ConvertTo-Json -Compress)) } else { Write-Host $o.error -ForegroundColor Red }
@@ -946,11 +947,11 @@ try {
         $upRows = @($rows | Where-Object { $_.ports -and $_.ports.health -like 'up*' })
         $arts = @($upRows | ForEach-Object { "$($_.app) :$($_.ports.port) $($_.ports.health)" }) -join '; '
         if ($result.ok -and $upRows.Count -gt 0) {
-          [void](& $ledScript done 'bring-up' -Story $S -Artifacts $arts -Root $Root -Json)
+          [void](& $ledScript done 'bring-up' -Story $S -Artifacts $arts -Root $Root -Project ([string]$Paths.ProjectId) -Json)
           $result.ledger = "bring-up -> done"
         }
         else {
-          [void](& $ledScript fail 'bring-up' -Story $S -Message $result.summary -Root $Root -Json)
+          [void](& $ledScript fail 'bring-up' -Story $S -Message $result.summary -Root $Root -Project ([string]$Paths.ProjectId) -Json)
           $result.ledger = "bring-up -> failed"
         }
       }

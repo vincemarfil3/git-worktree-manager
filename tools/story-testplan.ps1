@@ -29,13 +29,14 @@ param(
   [switch]$Json,
   [switch]$NoWrite,
   [switch]$Full,
-  [string]$Root  # override (native-host\host.ps1 / a Settings-driven root); blank = auto-resolve
+  [string]$Root,  # override (native-host\host.ps1 / a Settings-driven root); blank = auto-resolve
+  [string]$Project  # resolved project id (native-host\host.ps1); blank = active project / legacy resolution
 )
 
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'stg-paths.psm1') -Force -DisableNameChecking
-$Paths = Resolve-StgPaths -Root $Root
+$Paths = Resolve-StgPaths -Root $Root -Project $Project
 if ($Paths.NeedsSetup) {
   if ($Json) { [Console]::Out.Write((@{ ok = $false; error = $Paths.Error; needsSetup = $true } | ConvertTo-Json -Compress)) }
   else { Write-Host $Paths.Error -ForegroundColor Red }
@@ -357,7 +358,7 @@ try {
     try {
       $ledScript = Join-Path $PSScriptRoot 'story-ledger.ps1'
       if (Test-Path -LiteralPath $ledScript) {
-        [void](& $ledScript done 'testplan' -Story $S -Artifacts $outPath -Root $Root -Json)
+        [void](& $ledScript done 'testplan' -Story $S -Artifacts $outPath -Root $Root -Project ([string]$Paths.ProjectId) -Json)
         $result.ledger = 'testplan -> done'
       }
     }

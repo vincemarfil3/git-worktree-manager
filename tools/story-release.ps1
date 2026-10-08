@@ -13,8 +13,11 @@
   because remove-worktree.ps1 archives the whole node.
 
   'release' runs the ledger's own 'sync' first, so a story released in the real world gets its
-  prep-release phases backfilled from the node fields that already prove they happened (rel,
-  releaseBranch, chg_number, agiletest_urls) instead of showing a half-empty checklist forever.
+  'plan' phase backfilled from a node field that already proves it happened (document /
+  document_keycloak_setup) instead of showing a stale pending checklist item forever. (Prior to
+  the org-specific prep-release phases being dropped, sync also backfilled rel-ticket/
+  release-branch/agiletest/chg from rel/releaseBranch/agiletest_url(s)/chg_number(s) - those
+  phases and this backfill are gone now, along with them.)
 
   Usage:
     story-release.ps1 release   [STORY] [-Story S] [-Note m]   [-Json]
@@ -33,6 +36,7 @@ param(
   [switch]$All,
   [switch]$Json,
   [string]$Root,  # override (native-host\host.ps1 / a Settings-driven root); blank = auto-resolve
+  [string]$Project,  # resolved project id (native-host\host.ps1); blank = active project / legacy resolution
   # Swallow stray positionals rather than dying with a binding error before the try block can
   # produce a JSON frame. Reported as ok:false below.
   [Parameter(ValueFromRemainingArguments = $true)] $Extra
@@ -41,14 +45,13 @@ param(
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'stg-paths.psm1') -Force -DisableNameChecking
-$Paths = Resolve-StgPaths -Root $Root
+$Paths = Resolve-StgPaths -Root $Root -Project $Project
 if ($Paths.NeedsSetup) {
   if ($Json) { [Console]::Out.Write((@{ ok = $false; error = $Paths.Error; needsSetup = $true } | ConvertTo-Json -Compress)) }
   else { Write-Host $Paths.Error -ForegroundColor Red }
   exit 0
 }
 $Root           = $Paths.Root
-$LedgerName     = '.story-ship-state.json'
 $AllowedActions = @('release', 'unrelease', 'status')
 
 Import-Module (Join-Path $PSScriptRoot 'StoryLib.psm1') -Force -DisableNameChecking
@@ -72,9 +75,14 @@ function Out-Result($o) {
 function Invoke-Ledger([string[]]$LedgerArgs) {
   $lscript = Join-Path $PSScriptRoot 'story-ledger.ps1'
   if (-not (Test-Path -LiteralPath $lscript)) { return $null }
-  # Pass our own already-resolved -Root through so a child process can't re-resolve to a
-  # different root (e.g. a different auto-detect result) than the one this run is using.
-  $pargs = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $lscript) + $LedgerArgs + @('-Json', '-Root', $Root)
+  # Pass our own already-resolved -Root AND -Project through so a child process can't re-resolve
+  # to a different root/project (e.g. a different auto-detect result, or -Project unset here
+  # falling back to whichever project is currently active) than the one this run is using.
+  # [string]$Paths.ProjectId, not the bare value - ProjectId is $null (not '') in the legacy
+  # no-project branch, and a $null element is DROPPED when splatted to a native command, leaving a
+  # dangling -Project flag with no value that throws a parameter-binding error; casting to
+  # [string] gives '' instead, which passes through as a genuine empty argument, same as $Root.
+  $pargs = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $lscript) + $LedgerArgs + @('-Json', '-Root', $Root, '-Project', [string]$Paths.ProjectId)
   $out = & powershell.exe @pargs
   $global:LASTEXITCODE = 0
   $txt = ($out | Out-String).Trim()
@@ -100,7 +108,7 @@ function Get-NodeField($Node, [string]$Name) {
 
 # Released state for one story, from the node plus the ledger's 'deploy' phase. Pure file reads.
 function Get-ReleasedInfo([string]$S, $Node) {
-  $ledPath = Join-Path (Join-Path $Root $S) $LedgerName
+  $ledPath = Get-StgLedgerPath -Paths $Paths -Story $S -Node $Node
   $deploy = $null
   if (Test-Path -LiteralPath $ledPath) {
     try {
@@ -110,11 +118,15 @@ function Get-ReleasedInfo([string]$S, $Node) {
     }
     catch {}
   }
+  # Same worktreeRoot-blind gap Get-StgLedgerPath fixes above - a story whose worktrees live under
+  # a configured worktreeRoot always resolved $Root\$S here, found nothing, and reported
+  # present:false for a story that is, in fact, on disk.
+  $effRoot = if ($Node -and $Node.worktreeRoot) { [string]$Node.worktreeRoot } else { $Paths.Root }
   [pscustomobject]@{
     released        = (Get-NodeField $Node 'released')
     released_posted = (Get-NodeField $Node 'released_posted')
     deploy          = $deploy
-    present         = (Test-Path -LiteralPath (Join-Path $Root $S))
+    present         = (Test-Path -LiteralPath (Join-Path $effRoot $S))
   }
 }
 
@@ -125,7 +137,7 @@ try {
   if ($Action -notin $AllowedActions) { throw "Unknown action '$Action'. One of: $($AllowedActions -join ', ')." }
   if ($Extra) { throw ("unexpected extra argument(s): " + (@($Extra) -join ' ') + ". Usage: story-release.ps1 <release|unrelease|status> [STORY]") }
 
-  $reg = Read-Registry -Root $Root
+  $reg = Read-Registry -Root $Root -DocsDir $Paths.DocsDir
 
   # ---- status with no resolvable story: every story at once, for the popup's released chip ----
   if ($Action -eq 'status' -and ($All -or (-not $Story -and -not (Resolve-StoryFromPath -Root $Root -Registry $reg)))) {
@@ -184,7 +196,7 @@ try {
       $stamp = Get-Stamp
       $msg = if ($Note) { $Note } else { 'marked released' }
       $key = $S
-      Invoke-RegistryUpdate -Root $Root -Mutate {
+      Invoke-RegistryUpdate -Root $Root -DocsDir $Paths.DocsDir -Mutate {
         param($r)
         $node = $r.stories.$key
         if (-not $node) { return $false }
@@ -216,7 +228,7 @@ try {
       $was = $info.released
       $msg = if ($Reason) { $Reason } else { 'unreleased (rollback)' }
       $key = $S
-      Invoke-RegistryUpdate -Root $Root -Mutate {
+      Invoke-RegistryUpdate -Root $Root -DocsDir $Paths.DocsDir -Mutate {
         param($r)
         $node = $r.stories.$key
         if (-not $node) { return $false }

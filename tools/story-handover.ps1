@@ -35,19 +35,21 @@ param(
   [switch]$CheckOnly,
   [switch]$Json,
   [string]$Root,  # override (native-host\host.ps1 / a Settings-driven root); blank = auto-resolve
+  [string]$Project,  # resolved project id (native-host\host.ps1); blank = active project / legacy resolution
   [Parameter(ValueFromRemainingArguments = $true)] $Extra
 )
 
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'stg-paths.psm1') -Force -DisableNameChecking
-$Paths = Resolve-StgPaths -Root $Root
+$Paths = Resolve-StgPaths -Root $Root -Project $Project
 if ($Paths.NeedsSetup) {
   if ($Json) { [Console]::Out.Write((@{ ok = $false; error = $Paths.Error; needsSetup = $true } | ConvertTo-Json -Compress)) }
   else { Write-Host $Paths.Error -ForegroundColor Red }
   exit 0
 }
 $Root       = $Paths.Root
+$ReposRoot  = $Paths.ReposRoot
 $LedgerName = '.story-ship-state.json'
 $WsDir      = $Paths.WorkspaceDir
 # Files a retired story folder may keep and still count as empty: both are archived into
@@ -117,7 +119,7 @@ function Get-Holders([string]$Path) {
 # must never fail the handover.
 function Add-HistoryRecord([string]$Key, $Node, [string[]]$Apps, [string]$Why) {
   try {
-    $path = Get-HistoryPath -Root $Root
+    $path = Get-HistoryPath -Root $Root -DocsDir $Paths.DocsDir
     $hist = $null
     if (Test-Path -LiteralPath $path) { $hist = Read-JsonFile -Path $path }
     if (-not $hist) { $hist = [pscustomobject]@{ removed = @() } }
@@ -165,7 +167,7 @@ try {
     throw "current directory is inside $From or $To - cd out of the story folders first (this would self-lock the move)"
   }
 
-  $reg = Read-Registry -Root $Root
+  $reg = Read-Registry -Root $Root -DocsDir $Paths.DocsDir
   $toKey = Resolve-RegistryKey -Registry $reg -Key $To
   if (-not $toKey) { throw "'$To' is not in stories.json - do the registry half of the handover first (see the ganesha-worktree skill)" }
   $node = $reg.stories.$toKey
@@ -219,7 +221,7 @@ try {
     $dst = Join-Path $toDir $a
     # NOT $home - that's PowerShell's own read-only automatic variable (user profile dir);
     # assigning to it throws "Cannot overwrite variable HOME".
-    $homeDir = Join-Path $Root $a
+    $homeDir = Join-Path $ReposRoot $a
     if (-not (Test-GitWorktree -Dir $homeDir)) { throw "home base clone not found at $homeDir - cannot run 'git worktree move'" }
     $r = Invoke-GitCap -Dir $homeDir -GitArgs @('worktree', 'move', $src, $dst)
     if ($r.code -ne 0) { throw "worktree move failed for ${a}: $($r.out)" }
@@ -254,7 +256,7 @@ try {
       $result.archived = Add-HistoryRecord $fromKey $oldNode $apps "handed over to $toKey"
       if ($result.archived -eq 'archived') {
         $fk = $fromKey
-        Invoke-RegistryUpdate -Root $Root -Mutate {
+        Invoke-RegistryUpdate -Root $Root -DocsDir $Paths.DocsDir -Mutate {
           param($r)
           if (@($r.stories.PSObject.Properties.Name) -contains $fk) { $r.stories.PSObject.Properties.Remove($fk); return $true }
           return $false

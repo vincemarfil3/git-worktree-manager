@@ -19,13 +19,14 @@
 param(
   [Parameter(Position = 0)] [string]$Story,
   [switch]$Json,
-  [string]$Root  # override (native-host\host.ps1 / a Settings-driven root); blank = auto-resolve
+  [string]$Root,  # override (native-host\host.ps1 / a Settings-driven root); blank = auto-resolve
+  [string]$Project  # resolved project id (native-host\host.ps1); blank = active project / legacy resolution
 )
 
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'stg-paths.psm1') -Force -DisableNameChecking
-$Paths = Resolve-StgPaths -Root $Root
+$Paths = Resolve-StgPaths -Root $Root -Project $Project
 if ($Paths.NeedsSetup) {
   if ($Json) { [Console]::Out.Write((@{ ok = $false; error = $Paths.Error; needsSetup = $true } | ConvertTo-Json -Compress)) }
   else { Write-Host $Paths.Error -ForegroundColor Red }
@@ -58,14 +59,22 @@ function Test-Bom([string]$Path) {
 $result = [ordered]@{ ok = $true; scope = $null; findings = @(); counts = @{}; summary = '' }
 
 try {
-  $reg  = Read-Registry -Root $Root
+  $reg  = Read-Registry -Root $Root -DocsDir $Paths.DocsDir
   $hist = Read-JsonFile -Path $HistoryPath
   $map  = Read-JsonFile -Path $MapPath
-  $mapApps = if ($map) { @($map.apps.PSObject.Properties.Name) } else { @() }
+  # Get-StgNames, not the bare @($obj.PSObject.Properties.Name) idiom - throws PowerShell's
+  # one-element-array-of-null trap on an empty {} object (documented in CLAUDE.md's Dev gotchas).
+  # $regKeys empty produced a phantom bad-key-shape error (plus, in worktree mode, phantom no-apps/
+  # no-jira findings) on a genuinely empty registry - found live while verifying P5's tracking mode
+  # against a fresh project with zero stories.
+  $mapApps = if ($map) { Get-StgNames $map.apps } else { @() }
 
-  $regKeys = @($reg.stories.PSObject.Properties.Name)
+  $regKeys = Get-StgNames $reg.stories
   $histKeys = @(); if ($hist -and $hist.removed) { $histKeys = @(@($hist.removed) | ForEach-Object { "$($_.key)" }) }
-  $folders  = @(Get-StoryFolderNames -Root $Root -Registry $reg -History $hist)
+  # Scanning $Root for story-shaped folder names is a worktree-mode concept - in tracking mode
+  # $Root genuinely IS the tracked repo (src\, node_modules\, etc. live there), not a container of
+  # per-story folders, so this scan would be both meaningless and wasted work.
+  $folders  = if ($Paths.Mode -eq 'worktree') { @(Get-StoryFolderNames -Root $Root -Registry $reg -History $hist) } else { @() }
 
   $scope = if ($Story) { @($Story) } else { $regKeys }
   $result.scope = if ($Story) { $Story } else { 'all' }
@@ -113,7 +122,11 @@ try {
 
     # NOTE: @($missingProperty).Count is 1 in PowerShell (an array holding one $null), so a
     # missing field looks populated. Always filter the nulls out before counting.
-    if (-not @($node.apps | Where-Object { $_ }).Count) {
+    # 'apps' is a worktree-only concept - a tracking-mode node has no app list by design (no
+    # worktrees, no app checklist), so this used to fire as a permanent, unfixable ERROR on every
+    # single tracking-mode story ever created. Caught live, the first time story-doctor ran against
+    # a real tracking project.
+    if ($Paths.Mode -eq 'worktree' -and -not @($node.apps | Where-Object { $_ }).Count) {
       Add-Finding 'error' 'no-apps' $k 'node declares no apps' 'add the app list'
     }
     foreach ($a in @($node.apps | Where-Object { $_ })) {
@@ -141,72 +154,102 @@ try {
       }
     }
 
-    # Folder + ledger presence. A story's worktrees live under ITS OWN recorded worktreeRoot (set
-    # only when it differs from Root at creation time), never the current global setting - same
-    # "read the node's own field" rule every other worktree-aware command follows (CLAUDE.md's
-    # Migration safety section; this is the identical fix already applied to story-ledger.ps1's
-    # own story-folder resolution). Without this, a worktreeRoot-configured install always looked
-    # in $Root\$k, found nothing, and reported a false 'no story folder' error for every story that
-    # actually has a worktreeRoot override - i.e. every story on an install where Worktree Root is
-    # configured differently from Story Root.
-    $effRoot = if ($node.worktreeRoot) { [string]$node.worktreeRoot } else { $Root }
-    $sd = Join-Path $effRoot $k
-    if (-not (Test-Path -LiteralPath $sd)) {
-      Add-Finding 'error' 'node-without-folder' $k "no story folder at $sd" 'recreate the worktree (switch-story.ps1 new) or drop the node'
-      continue
-    }
-    $disc = Get-StoryFolders -Root $Root -Story $k -Node $node
-    foreach ($a in @($node.apps | Where-Object { $_ })) {
-      if (-not (Test-Path -LiteralPath (Join-Path $sd "$a"))) {
-        Add-Finding 'warn' 'app-without-worktree' $k "declared app '$a' has no folder under $k\" 'create it or remove it from apps'
+    # Folder + ledger + workspace presence are all worktree-only concepts (a per-story
+    # <root>\<KEY>\ folder, a ledger nested inside it, a .code-workspace file) - gated behind mode.
+    # Tracking mode's equivalents (doc file + ledger, at their own docsDir-based paths) are checked
+    # in the else branch below instead.
+    if ($Paths.Mode -eq 'worktree') {
+      # A story's worktrees live under ITS OWN recorded worktreeRoot (set only when it differs
+      # from Root at creation time), never the current global setting - same "read the node's own
+      # field" rule every other worktree-aware command follows (CLAUDE.md's Migration safety
+      # section; this is the identical fix already applied to story-ledger.ps1's own story-folder
+      # resolution). Without this, a worktreeRoot-configured install always looked in $Root\$k,
+      # found nothing, and reported a false 'no story folder' error for every story that actually
+      # has a worktreeRoot override - i.e. every story on an install where Worktree Root is
+      # configured differently from Story Root.
+      $effRoot = if ($node.worktreeRoot) { [string]$node.worktreeRoot } else { $Root }
+      $sd = Join-Path $effRoot $k
+      if (-not (Test-Path -LiteralPath $sd)) {
+        Add-Finding 'error' 'node-without-folder' $k "no story folder at $sd" 'recreate the worktree (switch-story.ps1 new) or drop the node'
+        continue
       }
-    }
-    if (@($disc.extras).Count) {
-      Add-Finding 'info' 'extra-folders' $k "non-worktree folder(s) in the story dir: $(@($disc.extras) -join ', ')" 'harmless - never treated as apps, and removal reports rather than deletes unknown content'
-    }
+      $disc = Get-StoryFolders -Root $Root -Story $k -Node $node
+      foreach ($a in @($node.apps | Where-Object { $_ })) {
+        if (-not (Test-Path -LiteralPath (Join-Path $sd "$a"))) {
+          Add-Finding 'warn' 'app-without-worktree' $k "declared app '$a' has no folder under $k" 'create it or remove it from apps'
+        }
+      }
+      if (@($disc.extras).Count) {
+        Add-Finding 'info' 'extra-folders' $k "non-worktree folder(s) in the story dir: $(@($disc.extras) -join ', ')" 'harmless - never treated as apps, and removal reports rather than deletes unknown content'
+      }
 
-    $lp = Join-Path $sd $LedgerName
-    if (-not (Test-Path -LiteralPath $lp)) {
-      Add-Finding 'warn' 'no-ledger' $k 'no .story-ship-state.json - phase state is not being tracked' "run: tools\story-ledger.ps1 init -Story $k"
+      $lp = Join-Path $sd $LedgerName
+      if (-not (Test-Path -LiteralPath $lp)) {
+        Add-Finding 'warn' 'no-ledger' $k 'no .story-ship-state.json - phase state is not being tracked' "run: tools\story-ledger.ps1 init -Story $k"
+      }
+      else {
+        $led = $null; try { $led = Read-JsonFile -Path $lp } catch {
+          Add-Finding 'error' 'ledger-unreadable' $k "ledger will not parse: $($_.Exception.Message)" 'fix or delete the file'
+        }
+        if ($led) {
+          $failed = @($led.phases | Where-Object { $_.status -eq 'failed' })
+          if ($failed.Count) {
+            Add-Finding 'warn' 'ledger-failed-phase' $k "phase(s) left failed: $((@($failed | ForEach-Object { $_.name })) -join ', ')" 'resolve or reset them before the story is torn down'
+          }
+          # Node fields that prove work the ledger still calls pending -> 'sync' would fix it. The
+          # rel-ticket/release-branch/chg/agiletest checks that used to live here were removed
+          # along with those phases (story-ledger.ps1's Invoke-Sync no longer seeds them either) -
+          # leaving them in would just be permanently-dead-but-still-live-looking code.
+          $seedable = @()
+          if ($node.document -and (@($led.phases | Where-Object { $_.name -eq 'plan' -and $_.status -eq 'pending' }).Count)) { $seedable += 'plan' }
+          if ($seedable.Count) {
+            Add-Finding 'warn' 'ledger-behind-node' $k "the node proves these happened but the ledger says pending: $($seedable -join ', ')" "run: tools\story-ledger.ps1 sync -Story $k"
+          }
+        }
+      }
+
+      if (-not (Test-Path -LiteralPath (Join-Path $WorkspaceDir "$k.code-workspace"))) {
+        Add-Finding 'info' 'no-workspace' $k 'no .code-workspace file' 'switch-story.ps1 open regenerates it'
+      }
+
+      # Decoupling 'released' from 'removed' means shipped stories accumulate on disk instead of
+      # being torn down. That is the point - but somebody has to say when they have sat there long
+      # enough, or the popup slowly fills with finished work again.
+      $rel = "$($node.released)".Trim()
+      if ($rel -and (Test-Path -LiteralPath $sd)) {
+        $relDt = [datetime]::MinValue
+        $parsed = [datetime]::TryParseExact($rel, 'yyyy-MM-dd HH:mm',
+          [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$relDt)
+        if (-not $parsed) { $parsed = [datetime]::TryParse($rel, [ref]$relDt) }
+        $days = if ($parsed) { [int]((Get-Date) - $relDt).TotalDays } else { 0 }
+        if ($days -ge $ReleasedGraceDays) {
+          Add-Finding 'info' 'released-not-removed' $k "released $rel ($days days ago) but the worktree is still on disk" "safe to tear down: remove-worktree.ps1 -Story $k  (preview with -CheckOnly)"
+        }
+      }
     }
     else {
-      $led = $null; try { $led = Read-JsonFile -Path $lp } catch {
-        Add-Finding 'error' 'ledger-unreadable' $k "ledger will not parse: $($_.Exception.Message)" 'fix or delete the file'
+      # Tracking mode: the doc file is the worktree-mode folder's equivalent - a story without one
+      # has nothing for Claude to write progress into. The ledger still applies too (story-doc.ps1/
+      # Invoke-New both init one, at its own docsDir-based path - Get-StgLedgerPath handles that),
+      # just without the app/workspace/extra-folders checks that have no tracking-mode equivalent.
+      $docPath = Get-StgStoryDocPath -Paths $Paths -Story $k
+      if (-not (Test-Path -LiteralPath $docPath)) {
+        Add-Finding 'warn' 'no-story-doc' $k "no doc at $docPath" "run: tools\story-doc.ps1 init -Story $k"
       }
-      if ($led) {
-        $failed = @($led.phases | Where-Object { $_.status -eq 'failed' })
-        if ($failed.Count) {
-          Add-Finding 'warn' 'ledger-failed-phase' $k "phase(s) left failed: $((@($failed | ForEach-Object { $_.name })) -join ', ')" 'resolve or reset them before the story is torn down'
-        }
-        # Node fields that prove work the ledger still calls pending -> 'sync' would fix it.
-        $seedable = @()
-        if ($node.rel -and (@($led.phases | Where-Object { $_.name -eq 'rel-ticket' -and $_.status -eq 'pending' }).Count)) { $seedable += 'rel-ticket' }
-        if ($node.releaseBranch -and (@($led.phases | Where-Object { $_.name -eq 'release-branch' -and $_.status -eq 'pending' }).Count)) { $seedable += 'release-branch' }
-        if (($node.chg_number -or $node.chg_numbers) -and (@($led.phases | Where-Object { $_.name -eq 'chg' -and $_.status -eq 'pending' }).Count)) { $seedable += 'chg' }
-        if (($node.agiletest_url -or $node.agiletest_urls) -and (@($led.phases | Where-Object { $_.name -eq 'agiletest' -and $_.status -eq 'pending' }).Count)) { $seedable += 'agiletest' }
-        if ($node.document -and (@($led.phases | Where-Object { $_.name -eq 'plan' -and $_.status -eq 'pending' }).Count)) { $seedable += 'plan' }
-        if ($seedable.Count) {
-          Add-Finding 'warn' 'ledger-behind-node' $k "the node proves these happened but the ledger says pending: $($seedable -join ', ')" "run: tools\story-ledger.ps1 sync -Story $k"
-        }
+      $lp = Get-StgLedgerPath -Paths $Paths -Story $k
+      if (-not (Test-Path -LiteralPath $lp)) {
+        Add-Finding 'warn' 'no-ledger' $k 'no .story-ship-state.json - phase state is not being tracked' "run: tools\story-ledger.ps1 init -Story $k"
       }
-    }
-
-    if (-not (Test-Path -LiteralPath (Join-Path $WorkspaceDir "$k.code-workspace"))) {
-      Add-Finding 'info' 'no-workspace' $k 'no .code-workspace file' 'switch-story.ps1 open regenerates it'
-    }
-
-    # Decoupling 'released' from 'removed' means shipped stories accumulate on disk instead of
-    # being torn down. That is the point - but somebody has to say when they have sat there long
-    # enough, or the popup slowly fills with finished work again.
-    $rel = "$($node.released)".Trim()
-    if ($rel -and (Test-Path -LiteralPath $sd)) {
-      $relDt = [datetime]::MinValue
-      $parsed = [datetime]::TryParseExact($rel, 'yyyy-MM-dd HH:mm',
-        [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$relDt)
-      if (-not $parsed) { $parsed = [datetime]::TryParse($rel, [ref]$relDt) }
-      $days = if ($parsed) { [int]((Get-Date) - $relDt).TotalDays } else { 0 }
-      if ($days -ge $ReleasedGraceDays) {
-        Add-Finding 'info' 'released-not-removed' $k "released $rel ($days days ago) but the worktree is still on disk" "safe to tear down: remove-worktree.ps1 -Story $k  (preview with -CheckOnly)"
+      else {
+        $led = $null; try { $led = Read-JsonFile -Path $lp } catch {
+          Add-Finding 'error' 'ledger-unreadable' $k "ledger will not parse: $($_.Exception.Message)" 'fix or delete the file'
+        }
+        if ($led) {
+          $failed = @($led.phases | Where-Object { $_.status -eq 'failed' })
+          if ($failed.Count) {
+            Add-Finding 'warn' 'ledger-failed-phase' $k "phase(s) left failed: $((@($failed | ForEach-Object { $_.name })) -join ', ')" 'resolve or reset them before the story is torn down'
+          }
+        }
       }
     }
   }
@@ -226,16 +269,34 @@ try {
       }
     }
 
-    foreach ($ws in @(Get-ChildItem -LiteralPath $WorkspaceDir -Filter '*.code-workspace' -ErrorAction SilentlyContinue)) {
-      $key = [IO.Path]::GetFileNameWithoutExtension($ws.Name)
-      if ($key -eq 'full_ui_workspace') { continue }
-      if ($regKeys -notcontains $key) {
-        Add-Finding 'warn' 'stale-workspace' $key "workspace file with no registry node: $($ws.FullName)" 'delete it - the story is gone'
+    # $WorkspaceDir is $null in tracking mode (no .code-workspace concept at all) - Get-ChildItem
+    # -LiteralPath $null throws on parameter binding regardless of -ErrorAction, so this needs an
+    # explicit guard, not just relying on the worktree-only $folders loop above being naturally
+    # empty. Every $WorkspaceDir/$WorktreeRoot consumer in this codebase needs the same care.
+    if ($WorkspaceDir) {
+      # Known non-story workspace files, never flagged as stale regardless of what's in the
+      # registry: 'full_ui_workspace' (a dead exclusion from before this repo's initial commit -
+      # nothing ever created that file, but something, somewhere, still might), plus the real
+      # project-wide workspaces this tool now generates itself (no story key, so they'd otherwise
+      # always show up here as "no registry node").
+      $knownNonStoryWorkspaces = @('full_ui_workspace', 'main_workspace', 'dev_workspace')
+      foreach ($ws in @(Get-ChildItem -LiteralPath $WorkspaceDir -Filter '*.code-workspace' -ErrorAction SilentlyContinue)) {
+        $key = [IO.Path]::GetFileNameWithoutExtension($ws.Name)
+        if ($knownNonStoryWorkspaces -contains $key) { continue }
+        if ($regKeys -notcontains $key) {
+          Add-Finding 'warn' 'stale-workspace' $key "workspace file with no registry node: $($ws.FullName)" 'delete it - the story is gone'
+        }
       }
     }
 
     # History integrity: a record with no ledger cannot answer "what happened on that story".
+    # $hist.removed is $null whenever stories_history.json doesn't exist yet (every project before
+    # its first removal) or has no 'removed' key - @($null) is PowerShell's one-element-array-of-
+    # null trap (documented in CLAUDE.md), so without the 'if (-not $e) { continue }' guard already
+    # used two loops up for $node.log, this fired a phantom info finding with an empty story key on
+    # every single doctor run against a project that has never had a removal. Caught live.
     foreach ($e in @($hist.removed)) {
+      if (-not $e) { continue }
       $names = @($e.PSObject.Properties.Name)
       if ($names -notcontains 'ledger' -and $names -notcontains 'node') {
         Add-Finding 'info' 'thin-history-record' "$($e.key)" 'history record carries neither a node nor a ledger' 'pre-dates the archiver; nothing to do'

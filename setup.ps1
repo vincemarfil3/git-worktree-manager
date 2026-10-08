@@ -187,7 +187,7 @@ $gitCmd = Get-Command git -ErrorAction SilentlyContinue
 if ($gitCmd) { Ok "git: $($gitCmd.Source)" } else { Bad 'git not found on PATH - install Git for Windows' }
 $codeCmd = Get-Command code -ErrorAction SilentlyContinue
 if ($codeCmd) { Ok "code (VS Code CLI): $($codeCmd.Source)" } else { Info "code (VS Code CLI): not on PATH (optional - 'Open workspace' just won't auto-launch VS Code)" }
-foreach ($s in @('switch-story.ps1', 'remove-worktree.ps1', 'story-ledger.ps1', 'story-release.ps1', 'story-doctor.ps1', 'story-env.ps1', 'story-handover.ps1', 'story-testplan.ps1', 'vault-status.ps1')) {
+foreach ($s in @('switch-story.ps1', 'remove-worktree.ps1', 'story-ledger.ps1', 'story-release.ps1', 'story-doctor.ps1', 'story-env.ps1', 'story-handover.ps1', 'story-testplan.ps1', 'vault-status.ps1', 'story-doc.ps1', 'install-agent-skill.ps1')) {
   $p = Join-Path $ToolsDir $s
   if (Test-Path $p) { Ok $s } else { Bad "$s MISSING from tools\ - re-download/re-clone the extension folder" }
 }
@@ -283,7 +283,13 @@ if (-not $paths.Root) {
 # ------------------------------------------------------------------------------------------------
 Section '7. EOD scheduled tasks'
 $installEod = Join-Path $ToolsDir 'install-eod-task.ps1'
-$existingTask = Get-ScheduledTask -TaskName '*EOD status reminder*' -ErrorAction SilentlyContinue
+# The configured prefix (Get-StgOrgDefaults.TaskNamePrefix), not a hardcoded 'EOD status reminder'
+# wildcard - install-eod-task.ps1 itself names the two tasks "<prefix> (early)"/"<prefix> (final)"
+# (same default value, 'Ganesha EOD status reminder', so this is a no-op change for anyone who
+# hasn't customized it in Settings), and the hardcoded wildcard would never match a task registered
+# under a customized prefix, silently skipping the re-register offer for it.
+$eodPrefix = (Get-StgOrgDefaults).TaskNamePrefix
+$existingTask = Get-ScheduledTask -TaskName "*$eodPrefix*" -ErrorAction SilentlyContinue
 if ($existingTask) {
   if (Confirm 'Re-register the EOD scheduled tasks at the new tools\ path?') {
     if ($PSCmdlet.ShouldProcess('EOD scheduled tasks', 'Re-register')) {

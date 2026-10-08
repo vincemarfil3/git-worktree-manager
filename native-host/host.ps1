@@ -9,9 +9,19 @@ $stdout = [Console]::OpenStandardOutput()
 
 function Read-Frame {
   $lp = New-Object byte[] 4; $g = 0
+  # A genuine 0-byte read here (nothing sent at all before the pipe closed) is the normal
+  # "no message, connection already ending" case - stays silent, same as before.
   while ($g -lt 4) { $n = $stdin.Read($lp, $g, 4 - $g); if ($n -le 0) { return $null }; $g += $n }
   $len = [BitConverter]::ToInt32($lp, 0)
-  if ($len -le 0 -or $len -gt 1048576) { return $null }
+  if ($len -le 0 -or $len -gt 1048576) {
+    # Unlike a clean EOF above, a length prefix that's negative or over the ~1MB native-messaging
+    # cap is unambiguously an anomaly (corruption, or a sender that isn't speaking this protocol) -
+    # Chrome used to just see "native host disconnected" with nothing to diagnose. Write-Frame
+    # doesn't need the message to have been parsed, so a reply is possible even here; wrapped in its
+    # own try/catch since stdout could itself be in a bad state by this point.
+    try { Write-Frame (@{ ok = $false; error = "frame too large or invalid (length=$len)" } | ConvertTo-Json -Compress) } catch {}
+    return $null
+  }
   $buf = New-Object byte[] $len; $o = 0
   while ($o -lt $len) { $n = $stdin.Read($buf, $o, $len - $o); if ($n -le 0) { return $null }; $o += $n }
   [System.Text.Encoding]::UTF8.GetString($buf, 0, $len)
@@ -41,12 +51,17 @@ $ScriptsDir = (Resolve-Path (Join-Path $PSScriptRoot '..\tools')).Path
 # same %LOCALAPPDATA%\story-tab-groups\stg-config.json this host used to maintain its own private
 # copy of the read/write logic for).
 Import-Module (Join-Path $ScriptsDir 'stg-paths.psm1') -Force -DisableNameChecking
-$StgConfig = Get-StgConfig
-$OrgDefaults = Get-StgOrgDefaults
-$PathsInfo = Resolve-StgPaths
-$GRoot = $PathsInfo.Root  # $null when NeedsSetup - every action below must check that first
 
-try { if ($GRoot) { Import-Module (Join-Path $ScriptsDir 'StoryLib.psm1') -Force -DisableNameChecking } } catch {}
+# $StgConfig/$OrgDefaults/$PathsInfo/$GRoot/StoryLib used to be computed HERE, at module scope,
+# before the incoming message was even read - which meant they could never know which project a
+# request was actually for. They're computed instead just after $msg parses, inside the main try
+# block below (Resolve-StgPaths -Project ([string]$msg.project)), so $msg.project genuinely drives
+# resolution. Strict improvement in passing: a corrupt config used to kill the process with NO
+# frame written at all ("native host has exited" in Chrome); now it's inside the try/catch and
+# still produces a clean {ok:false} reply. Test-Key/Test-RootReady/Invoke-StoryScript below
+# reference $GRoot/$PathsInfo in their bodies but are only ever CALLED from inside that same try
+# block, after the reassignment - PowerShell resolves a script-scoped variable at call time, not
+# at the function's textual definition point, so this is safe.
 
 function Test-Key([string]$k) {
   if (Get-Command Test-StoryKey -ErrorAction SilentlyContinue) { return (Test-StoryKey $k) }
@@ -61,7 +76,11 @@ function Test-Key([string]$k) {
 # "root not configured" instead of each action guessing or silently scanning the wrong tree.
 function Test-RootReady {
   if (-not $GRoot) {
-    Reply @{ ok = $false; error = $PathsInfo.Error; needsSetup = $true }
+    # unknownProjectId is always present (true/false), not just on the failure path that set it -
+    # so the popup can tell "you asked for a project that no longer exists" (ProjectSource is
+    # exactly 'parameter (invalid)' when $msg.project was given but didn't match anything
+    # configured) apart from "nothing is configured yet at all" without parsing .error text.
+    Reply @{ ok = $false; error = $PathsInfo.Error; needsSetup = $true; unknownProjectId = ($PathsInfo.ProjectSource -eq 'parameter (invalid)') }
     return $false
   }
   return $true
@@ -98,13 +117,40 @@ try {
   if (-not $raw) { exit 0 }
   $msg = $raw | ConvertFrom-Json
 
+  # Resolve AFTER the message is known, so $msg.project genuinely drives which project's paths/
+  # org settings/mode this request sees - see the comment above Test-Key for why this moved here
+  # from module scope. An unknown project id (a project the popup still shows a stale reference to,
+  # e.g. deleted from another tab) is a hard NeedsSetup failure via Resolve-StgPaths itself, not a
+  # silent fallback to whichever project happens to be active - Test-RootReady surfaces it with
+  # unknownProjectId:true for any action that needs a root; root-independent actions (ping,
+  # getConfig, setConfig, preflight, setappmap, projects) never call Test-RootReady, so a stale
+  # project id in $msg never blocks them.
+  $PathsInfo = Resolve-StgPaths -Project ([string]$msg.project)
+  $GRoot = $PathsInfo.Root  # $null when NeedsSetup - every action below must check that first
+  $StgConfig = Get-StgConfig
+  # -Project here too, not the zero-arg call this used to be - otherwise getConfig's
+  # repoAliases/effectiveJiraBaseUrl/effectiveGithubOrg and the 'apps' action's repo-alias lookup
+  # would keep reflecting the top-level mirror regardless of which project actually resolved.
+  $OrgDefaults = Get-StgOrgDefaults -Project $PathsInfo.ProjectId
+  # 'add'/'addcheck' forward -WorktreeRoot/-BranchFormat to switch-story.ps1 only when the target
+  # actually HAS a custom one (an empty value here means "use switch-story.ps1's own default", not
+  # "clear it"). Read from the RESOLVED project's own raw field, not $StgConfig's top-level mirror -
+  # the mirror only ever reflects the ACTIVE project, so once -Project can target a non-active
+  # project, reading the mirror here would silently apply the active project's override to a
+  # DIFFERENT project's worktrees. Falls back to $StgConfig (today's exact legacy behavior) only
+  # when no project context resolved at all.
+  $rawWtRoot = if ($PathsInfo.Project) { [string]$PathsInfo.Project.worktreeRoot } else { [string]$StgConfig.worktreeRoot }
+  $rawBranchFormat = if ($PathsInfo.Project) { [string]$PathsInfo.Project.branchFormat } else { [string]$StgConfig.branchFormat }
+
+  try { if ($GRoot) { Import-Module (Join-Path $ScriptsDir 'StoryLib.psm1') -Force -DisableNameChecking } } catch {}
+
   switch ([string]$msg.action) {
     'ping' { Reply @{ ok = $true; pong = $true } }
     'remove' {
       if (-not (Test-RootReady)) { break }
       $story = [string]$msg.story
       if (-not (Test-Key $story)) { Reply @{ ok = $false; error = "invalid story key" }; break }
-      $sargs = @('-Story', $story, '-Root', $GRoot, '-Json')
+      $sargs = @('-Story', $story, '-Root', $GRoot, '-Project', [string]$PathsInfo.ProjectId, '-Json')
       if ($msg.discardGenerated -eq $true) { $sargs += '-DiscardGenerated' }
       # Popup sends this once a blocked story's typed "CONFIRM" gate passes - skips the dirty/
       # unpushed abort. Discards uncommitted changes permanently; unpushed COMMITS stay safe (the
@@ -115,7 +161,7 @@ try {
     'check' {
       if (-not (Test-RootReady)) { break }
       # Read-only: blocker status for every story in stories.json (popup "ready/blocked" badges).
-      Invoke-StoryScript 'remove-worktree.ps1' @('-CheckAll', '-Root', $GRoot, '-Json') 'check'
+      Invoke-StoryScript 'remove-worktree.ps1' @('-CheckAll', '-Root', $GRoot, '-Project', [string]$PathsInfo.ProjectId, '-Json') 'check'
     }
     'history' {
       if (-not (Test-RootReady)) { break }
@@ -141,16 +187,27 @@ try {
       $regPath = $PathsInfo.StoriesPath
       if (-not (Test-Path $regPath)) { Reply @{ ok = $true; json = '{}' }; break }
       $reg = (Get-Content (Resolve-Path $regPath).Path -Raw -Encoding UTF8) | ConvertFrom-Json
-      $parts = @()
-      foreach ($k in @($reg.stories.PSObject.Properties.Name)) {
-        $lp = Join-Path (Join-Path $GRoot $k) '.story-ship-state.json'
+      # [ordered] hashtable + ConvertTo-Json, not string concatenation - the old '{' + parts -join
+      # ',' + '}' spliced each ledger file's raw text in unvalidated, so one malformed ledger
+      # corrupted the WHOLE payload (background.js's JSON.parse on the combined string would fail
+      # for every story, not just the bad one). Each ledger is now parsed independently, so a bad
+      # one is simply skipped rather than taking the whole reply down with it.
+      $ledgers = [ordered]@{}
+      # Get-StgNames, not the bare @($reg.stories.PSObject.Properties.Name) idiom - see the 'apps'
+      # action's comment for why an empty {} registry needs this.
+      foreach ($k in (Get-StgNames $reg.stories)) {
+        $node = $reg.stories.$k
+        # Get-StgLedgerPath, not a hardcoded Join-Path $GRoot $k - a story whose worktrees live
+        # under a configured worktreeRoot otherwise had its ledger silently skipped here, so
+        # getLedgers/the popup's phase chips came back empty for it even though the ledger exists.
+        $lp = Get-StgLedgerPath -Paths $PathsInfo -Story $k -Node $node
         if (-not (Test-Path $lp)) { continue }
         try {
           $txt = ([IO.File]::ReadAllText((Resolve-Path $lp).Path)).Trim()
-          if ($txt) { $parts += ('"' + ($k -replace '"', '\"') + '":' + $txt) }
+          if ($txt) { $ledgers[$k] = ($txt | ConvertFrom-Json) }
         } catch {}
       }
-      Reply @{ ok = $true; json = ('{' + ($parts -join ',') + '}') }
+      Reply @{ ok = $true; json = ($ledgers | ConvertTo-Json -Depth 10 -Compress) }
     }
     'envstatus' {
       if (-not (Test-RootReady)) { break }
@@ -159,7 +216,7 @@ try {
       # and the host is single-shot - it blocks until the probe returns.
       $story = [string]$msg.story
       if (-not (Test-Key $story)) { Reply @{ ok = $false; error = "invalid story key" }; break }
-      Invoke-StoryScript 'story-env.ps1' @('status', $story, '-Root', $GRoot, '-Json') 'envstatus'
+      Invoke-StoryScript 'story-env.ps1' @('status', $story, '-Root', $GRoot, '-Project', [string]$PathsInfo.ProjectId, '-Json') 'envstatus'
     }
     'release' {
       if (-not (Test-RootReady)) { break }
@@ -172,12 +229,12 @@ try {
       $sargs = @($act, '-Story', $story)
       if ($msg.reason) { $sargs += @('-Reason', [string]$msg.reason) }
       if ($msg.note)   { $sargs += @('-Note', [string]$msg.note) }
-      Invoke-StoryScript 'story-release.ps1' ($sargs + @('-Root', $GRoot, '-Json')) 'release'
+      Invoke-StoryScript 'story-release.ps1' ($sargs + @('-Root', $GRoot, '-Project', [string]$PathsInfo.ProjectId, '-Json')) 'release'
     }
     'released' {
       if (-not (Test-RootReady)) { break }
       # Read-only released state for every story (the popup's released chip). Pure file reads.
-      Invoke-StoryScript 'story-release.ps1' @('status', '-All', '-Root', $GRoot, '-Json') 'released'
+      Invoke-StoryScript 'story-release.ps1' @('status', '-All', '-Root', $GRoot, '-Project', [string]$PathsInfo.ProjectId, '-Json') 'released'
     }
     'setLinks' {
       if (-not (Test-RootReady)) { break }
@@ -193,12 +250,39 @@ try {
       # issue with a raw (unencoded) JSON argument.
       $payload = @{ set = @($msg.set); remove = @($msg.remove) } | ConvertTo-Json -Compress -Depth 6
       $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payload))
-      Invoke-StoryScript 'switch-story.ps1' @('links', $story, '-LinksB64', $b64, '-Root', $GRoot, '-Json') 'setLinks'
+      Invoke-StoryScript 'switch-story.ps1' @('links', $story, '-LinksB64', $b64, '-Root', $GRoot, '-Project', [string]$PathsInfo.ProjectId, '-Json') 'setLinks'
+    }
+    'storydoc' {
+      if (-not (Test-RootReady)) { break }
+      # Tracking mode's per-story markdown doc - init/append/path/show, straight to story-doc.ps1
+      # rather than through switch-story.ps1's 'note' (which has no -Json path of its own - see
+      # story-doc.ps1's own header comment and switch-story.ps1's Invoke-Note for why this is the
+      # extension's real entry point, and 'note' stays CLI-only parity). { story, docAction, text? }
+      # - docAction, NOT action: $msg.action is already consumed by the switch that routed the
+      # message here in the first place, so reading it again always yields the literal string
+      # 'storydoc' regardless of what the caller actually asked for. Caught live: every single
+      # call failed with "invalid storydoc action: storydoc" until this was renamed.
+      $story = [string]$msg.story
+      if (-not (Test-Key $story)) { Reply @{ ok = $false; error = "invalid story key" }; break }
+      $docAction = [string]$msg.docAction
+      if ($docAction -notin @('init', 'append', 'path', 'show')) { Reply @{ ok = $false; error = "invalid storydoc action: $docAction" }; break }
+      $sargs = @($docAction, $story)
+      # -TextB64, same reasoning as setLinks' -LinksB64 just above: a raw multi-line/quoted string
+      # does not survive this script's own -File child-process invocation of story-doc.ps1.
+      if ($msg.text) {
+        $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$msg.text))
+        $sargs += @('-TextB64', $b64)
+      }
+      if ($msg.title) {
+        $tb64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$msg.title))
+        $sargs += @('-TitleB64', $tb64)
+      }
+      Invoke-StoryScript 'story-doc.ps1' ($sargs + @('-Root', $GRoot, '-Project', [string]$PathsInfo.ProjectId, '-Json')) 'storydoc'
     }
     'doctor' {
       if (-not (Test-RootReady)) { break }
       # Read-only registry/folder/ledger reconciliation (story-doctor.ps1).
-      Invoke-StoryScript 'story-doctor.ps1' @('-Root', $GRoot, '-Json') 'doctor'
+      Invoke-StoryScript 'story-doctor.ps1' @('-Root', $GRoot, '-Project', [string]$PathsInfo.ProjectId, '-Json') 'doctor'
     }
     'add' {
       if (-not (Test-RootReady)) { break }
@@ -210,13 +294,13 @@ try {
       $story = [string]$msg.story
       if (-not (Test-Key $story)) { Reply @{ ok = $false; error = "invalid story key" }; break }
       $appsCsv = (@($msg.apps) -join ',')
-      $sargs = @('new', $story, [string]$msg.env, $appsCsv, '-NoInstall', '-Root', $GRoot, '-Json')
+      $sargs = @('new', $story, [string]$msg.env, $appsCsv, '-NoInstall', '-Root', $GRoot, '-Project', [string]$PathsInfo.ProjectId, '-Json')
       if ($msg.open -ne $false) { $sargs += '-Open' }
       if ($msg.title)   { $sargs += @('-Title', [string]$msg.title) }
       if ($msg.jiraUrl) { $sargs += @('-JiraUrl', [string]$msg.jiraUrl) }
       if ($msg.branch)  { $sargs += @('-Branch', [string]$msg.branch) }
-      if ($StgConfig.worktreeRoot) { $sargs += @('-WorktreeRoot', [string]$StgConfig.worktreeRoot) }
-      if ($StgConfig.branchFormat) { $sargs += @('-BranchFormat', [string]$StgConfig.branchFormat) }
+      if ($rawWtRoot) { $sargs += @('-WorktreeRoot', $rawWtRoot) }
+      if ($rawBranchFormat) { $sargs += @('-BranchFormat', $rawBranchFormat) }
       Invoke-StoryScript 'switch-story.ps1' $sargs 'add'
     }
     'addcheck' {
@@ -227,10 +311,10 @@ try {
       $story = [string]$msg.story
       if (-not (Test-Key $story)) { Reply @{ ok = $false; error = "invalid story key" }; break }
       $appsCsv = (@($msg.apps) -join ',')
-      $sargs = @('new', $story, [string]$msg.env, $appsCsv, '-CheckOnly', '-Root', $GRoot, '-Json')
+      $sargs = @('new', $story, [string]$msg.env, $appsCsv, '-CheckOnly', '-Root', $GRoot, '-Project', [string]$PathsInfo.ProjectId, '-Json')
       if ($msg.branch) { $sargs += @('-Branch', [string]$msg.branch) }
-      if ($StgConfig.worktreeRoot) { $sargs += @('-WorktreeRoot', [string]$StgConfig.worktreeRoot) }
-      if ($StgConfig.branchFormat) { $sargs += @('-BranchFormat', [string]$StgConfig.branchFormat) }
+      if ($rawWtRoot) { $sargs += @('-WorktreeRoot', $rawWtRoot) }
+      if ($rawBranchFormat) { $sargs += @('-BranchFormat', $rawBranchFormat) }
       Invoke-StoryScript 'switch-story.ps1' $sargs 'addcheck'
     }
     'addapps' {
@@ -242,7 +326,7 @@ try {
       if (-not (Test-Key $story)) { Reply @{ ok = $false; error = "invalid story key" }; break }
       $appsCsv = (@($msg.apps) -join ',')
       if (-not $appsCsv) { Reply @{ ok = $false; error = "no apps given" }; break }
-      $sargs = @('add', $story, $appsCsv, '-NoInstall', '-Root', $GRoot, '-Json')
+      $sargs = @('add', $story, $appsCsv, '-NoInstall', '-Root', $GRoot, '-Project', [string]$PathsInfo.ProjectId, '-Json')
       if ($msg.open -ne $false) { $sargs += '-Open' }
       Invoke-StoryScript 'switch-story.ps1' $sargs 'addapps'
     }
@@ -253,7 +337,7 @@ try {
       if (-not (Test-Key $story)) { Reply @{ ok = $false; error = "invalid story key" }; break }
       $appsCsv = (@($msg.apps) -join ',')
       if (-not $appsCsv) { Reply @{ ok = $false; error = "no apps given" }; break }
-      Invoke-StoryScript 'switch-story.ps1' @('add', $story, $appsCsv, '-CheckOnly', '-Root', $GRoot, '-Json') 'addappscheck'
+      Invoke-StoryScript 'switch-story.ps1' @('add', $story, $appsCsv, '-CheckOnly', '-Root', $GRoot, '-Project', [string]$PathsInfo.ProjectId, '-Json') 'addappscheck'
     }
     'openworkspace' {
       if (-not (Test-RootReady)) { break }
@@ -262,7 +346,188 @@ try {
       # only opens once, at creation, if the checkbox was checked).
       $story = [string]$msg.story
       if (-not (Test-Key $story)) { Reply @{ ok = $false; error = "invalid story key" }; break }
-      Invoke-StoryScript 'switch-story.ps1' @('open', $story, '-Root', $GRoot, '-Json') 'openworkspace'
+      Invoke-StoryScript 'switch-story.ps1' @('open', $story, '-Root', $GRoot, '-Project', [string]$PathsInfo.ProjectId, '-Json') 'openworkspace'
+    }
+    'openmain' {
+      if (-not (Test-RootReady)) { break }
+      # No story key at all - the project-wide planning workspace. Worktree mode: every home-base
+      # app clone, regenerated fresh on every call. Tracking mode: the single
+      # main_workspace.code-workspace New-StgTrackingScaffold wrote once at project-add time
+      # (switch-story.ps1's own Invoke-OpenMain branches on mode internally - both modes get
+      # main_workspace, see CLAUDE.md's main_workspace/dev_workspace section).
+      Invoke-StoryScript 'switch-story.ps1' @('openmain', '-Root', $GRoot, '-Project', [string]$PathsInfo.ProjectId, '-Json') 'openmain'
+    }
+    'opendev' {
+      if (-not (Test-RootReady)) { break }
+      # Tracking-mode only - the single repo's dev workspace, listing just the actual git repos
+      # (regenerated fresh on every call, unlike main_workspace above). switch-story.ps1's own
+      # Invoke-OpenDev refuses cleanly with ok:false for a worktree-mode project.
+      Invoke-StoryScript 'switch-story.ps1' @('opendev', '-Root', $GRoot, '-Project', [string]$PathsInfo.ProjectId, '-Json') 'opendev'
+    }
+    'projects' {
+      # Root-independent (no Test-RootReady) - the project dropdown/picker must render even on a
+      # totally broken install (no root configured at all yet). Resolves each configured project's
+      # own paths (not just its bare id/name) so the popup can show per-project needsSetup/error
+      # rather than treating "listed" and "actually usable" as the same thing.
+      #
+      # $allProjects = Get-StgProjects FIRST, then `foreach` over the captured variable - NOT
+      # `Get-StgProjects | ForEach-Object {...}` piping the function call directly. Get-StgProjects
+      # uses -NoEnumerate (stg-paths.psm1) so a one-project result survives crossing its own return
+      # boundary as a real array rather than collapsing to a bare object; the sharp edge is that
+      # -NoEnumerate suppresses pipeline unrolling for ANY consumer, not just assignment, so piping
+      # the call directly binds $_ to the WHOLE array as one item once 2+ projects exist (confirmed
+      # exactly this bug, and fixed the same way, in Resolve-StgPaths's -Root reverse lookup).
+      $allProjects = Get-StgProjects
+      $list = @()
+      foreach ($p in $allProjects) {
+        $pPaths = Resolve-StgPaths -Project $p.id
+        $list += [pscustomobject]@{
+          id = $p.id
+          name = $p.name
+          mode = if ($p.mode) { [string]$p.mode } else { 'worktree' }
+          root = [string]$p.root
+          needsSetup = [bool]$pPaths.NeedsSetup
+          error = $pPaths.Error
+        }
+      }
+      Reply @{ ok = $true; activeProject = [string](Get-StgConfig).activeProject; projects = @($list) }
+    }
+    'addProject' {
+      # Settings' "+ Add project" form. Root-independent by design (no Test-RootReady) - creating
+      # the FIRST project is exactly the case where no root is configured yet.
+      $name = [string]$msg.name
+      $root = [string]$msg.root
+      if (-not $name) { Reply @{ ok = $false; error = 'project name required' }; break }
+      if (-not $root -or -not (Test-Path $root -PathType Container)) { Reply @{ ok = $false; error = "root path not found: $root" }; break }
+      try {
+        # P5: the UI now offers 'tracking' as a real, working choice, so mode IS read from $msg -
+        # but still validated against an allow-list rather than trusted wholesale (a stale/hand-
+        # built caller sending anything else would otherwise create a project New-StgProject's own
+        # mode-gated auto-create doesn't know what to do with).
+        $mode = [string]$msg.mode
+        if ($mode -notin @('worktree', 'tracking')) { $mode = 'worktree' }
+        $proj = New-StgProject -Name $name -Root $root -Mode $mode
+        Reply @{ ok = $true; project = $proj }
+      } catch { Reply @{ ok = $false; error = $_.Exception.Message } }
+    }
+    'installskill' {
+      # Settings' Agent integration card - renders (and, for the Claude Code button, installs)
+      # the story-tab-groups skill for the resolved project. Root-independent (no Test-RootReady):
+      # rendering needs a resolved PROJECT (root/tools-dir to bake into the template), not a live
+      # "does this root's data currently check out" gate the way a story-mutating action would.
+      # $msg.scope validated against an allow-list before being forwarded - same posture as
+      # setappmap's host-computed destination and storydoc's docAction validation, never a path or
+      # action string trusted wholesale from the caller.
+      $scope = [string]$msg.scope
+      if ($msg.install -eq $true -and $scope -notin @('user', 'project')) { Reply @{ ok = $false; error = "invalid scope: $scope" }; break }
+      $action = if ($msg.install -eq $true) { 'install' } else { 'render' }
+      $sargs = @($action, '-Project', [string]$PathsInfo.ProjectId)
+      if ($action -eq 'install') { $sargs += @('-Scope', $scope) }
+      Invoke-StoryScript 'install-agent-skill.ps1' ($sargs + '-Json') 'installskill'
+    }
+    'getProjectConfig' {
+      # Read counterpart to setProjectConfig: ONE named project's own raw fields, plus what they
+      # resolve to right now (mirrors getConfig's root/effectiveRoot pairing, just scoped to a
+      # SPECIFIC project rather than always the active one). getConfig's own raw fields ALWAYS
+      # reflect the top-level mirror (the active project) regardless of $msg.project - only its
+      # effective* fields honor -Project - so Settings' per-project cards need this instead once a
+      # NON-active project is selected in #settingsProjSel; there was previously no way to read a
+      # non-active project's own override values at all.
+      $id = [string]$msg.id
+      if (-not $id) { Reply @{ ok = $false; error = 'project id required' }; break }
+      $proj = Get-StgProject -Id $id
+      if (-not $proj) { Reply @{ ok = $false; error = "unknown project id: $id" }; break }
+      $pPaths = Resolve-StgPaths -Project $id
+      $pOrg = Get-StgOrgDefaults -Project $id
+      Reply @{
+        ok = $true
+        id = $proj.id
+        name = [string]$proj.name
+        mode = if ($proj.mode) { [string]$proj.mode } else { 'worktree' }
+        root = [string]$proj.root
+        worktreeRoot = [string]$proj.worktreeRoot
+        workspaceRoot = [string]$proj.workspaceRoot
+        reposRoot = [string]$proj.reposRoot
+        branchFormat = [string]$proj.branchFormat
+        jiraBaseUrl = [string]$proj.jiraBaseUrl
+        githubOrg = [string]$proj.githubOrg
+        repoAliases = $pOrg.RepoAliases
+        taskNamePrefix = [string]$proj.taskNamePrefix
+        owner = [string]$proj.owner
+        hiddenApps = @($proj.hiddenApps | Where-Object { $_ })
+        effectiveRoot = $pPaths.Root
+        effectiveWorktreeRoot = $pPaths.WorktreeRoot
+        effectiveWorkspaceRoot = $pPaths.WorkspaceDir
+        effectiveReposRoot = $pPaths.ReposRoot
+        effectiveBranchFormat = $pPaths.BranchFormat
+        effectiveJiraBaseUrl = $pOrg.JiraBaseUrl
+        effectiveGithubOrg = $pOrg.GithubOrg
+        needsSetup = [bool]$pPaths.NeedsSetup
+      }
+    }
+    'setProjectConfig' {
+      # Edits ONE named project's own fields, independent of which project is active - the
+      # Settings page's per-project cards use this once a NON-active project is selected in
+      # #settingsProjSel. 'mode' and 'id' are deliberately never patchable here: mode is set once at
+      # creation (converting an existing project's mode is a real data-migration question, not a
+      # field edit - worktrees/ledgers already exist in worktree-mode locations); id is derived and
+      # stable, used elsewhere (stories.json's own path, ledger locations) - renaming it out from
+      # under those would orphan them.
+      $id = [string]$msg.id
+      if (-not $id) { Reply @{ ok = $false; error = 'project id required' }; break }
+      $patch = @{}
+      foreach ($k in @('name', 'root', 'worktreeRoot', 'workspaceRoot', 'reposRoot', 'branchFormat', 'jiraBaseUrl', 'githubOrg', 'taskNamePrefix', 'owner')) {
+        if ($msg.PSObject.Properties.Name -contains $k) { $patch[$k] = [string]$msg.$k }
+      }
+      if ($msg.PSObject.Properties.Name -contains 'repoAliases' -and $msg.repoAliases) { $patch['repoAliases'] = $msg.repoAliases }
+      if ($msg.PSObject.Properties.Name -contains 'hiddenApps') { $patch['hiddenApps'] = @($msg.hiddenApps | Where-Object { $_ }) }
+      if ($patch.ContainsKey('root') -and $patch['root'] -and -not (Test-Path $patch['root'] -PathType Container)) {
+        Reply @{ ok = $false; error = "root path not found: $($patch['root'])" }; break
+      }
+      try {
+        $proj = Update-StgProject -Id $id -Patch $patch
+        Reply @{ ok = $true; project = $proj }
+      } catch { Reply @{ ok = $false; error = $_.Exception.Message } }
+    }
+    'removeProject' {
+      # "Forget" a project - never touches stories.json/worktrees/the repo on disk, so this needs no
+      # typed-CONFIRM the way 🗑 worktree removal does. Settings' Remove button still confirms once
+      # client-side, but the host action itself trusts the caller.
+      $id = [string]$msg.id
+      if (-not $id) { Reply @{ ok = $false; error = 'project id required' }; break }
+      try {
+        Remove-StgProject -Id $id
+        Reply @{ ok = $true }
+      } catch { Reply @{ ok = $false; error = $_.Exception.Message } }
+    }
+    'allstories' {
+      # Every project's raw stories.json in ONE frame, so a multi-project popup's cold start is 1
+      # round trip, not N (same reasoning 'stories'/'history' already use raw text over
+      # ConvertTo-Json for one project - deeply nested per-story logs exceed a reasonable -Depth).
+      # A project whose own root doesn't currently resolve still gets a slot (empty json), not
+      # silently dropped, so the popup can show *something* for it rather than a story list that's
+      # mysteriously short one project. Chrome caps a native-messaging reply at ~1MB; a running
+      # byte count skips the largest remaining payloads once the total would approach that,
+      # reporting which ids were skipped so the popup can fall back to a per-project 'stories' call
+      # for just those.
+      $allProjects = Get-StgProjects
+      $result = [ordered]@{}
+      $truncated = @()
+      $totalBytes = 0
+      foreach ($proj in $allProjects) {
+        $mode = if ($proj.mode) { [string]$proj.mode } else { 'worktree' }
+        $pPaths = Resolve-StgPaths -Project $proj.id
+        if ($pPaths.NeedsSetup -or -not (Test-Path $pPaths.StoriesPath)) {
+          $result[$proj.id] = @{ name = $proj.name; mode = $mode; json = '' }
+          continue
+        }
+        $txt = [string](Get-Content (Resolve-Path $pPaths.StoriesPath).Path -Raw -Encoding UTF8)
+        $bytes = [System.Text.Encoding]::UTF8.GetByteCount($txt)
+        if (($totalBytes + $bytes) -gt 800000) { $truncated += $proj.id; continue }
+        $totalBytes += $bytes
+        $result[$proj.id] = @{ name = $proj.name; mode = $mode; json = $txt }
+      }
+      Reply @{ ok = $true; activeProject = [string](Get-StgConfig).activeProject; projects = $result; truncated = @($truncated) }
     }
     'getConfig' {
       # Current effective settings for the Options page: what's actually configured, PLUS what
@@ -274,6 +539,7 @@ try {
         root = [string]$StgConfig.root
         worktreeRoot = [string]$StgConfig.worktreeRoot
         workspaceRoot = [string]$StgConfig.workspaceRoot
+        reposRoot = [string]$StgConfig.reposRoot
         branchFormat = [string]$StgConfig.branchFormat
         jiraBaseUrl = [string]$StgConfig.jiraBaseUrl
         githubOrg = [string]$StgConfig.githubOrg
@@ -284,6 +550,7 @@ try {
         effectiveRoot = $GRoot
         effectiveWorktreeRoot = $PathsInfo.WorktreeRoot
         effectiveWorkspaceRoot = $PathsInfo.WorkspaceDir
+        effectiveReposRoot = $PathsInfo.ReposRoot
         effectiveBranchFormat = $effBranchFormat
         effectiveJiraBaseUrl = $OrgDefaults.JiraBaseUrl
         effectiveGithubOrg = $OrgDefaults.GithubOrg
@@ -295,54 +562,60 @@ try {
     }
     'setConfig' {
       # Writes root/worktreeRoot/workspaceRoot/branchFormat/jiraBaseUrl/githubOrg/taskNamePrefix/
-      # owner to stg-config.json via stg-paths.psm1's Set-StgConfig - one implementation shared by
-      # every tools\*.ps1 script and this host, rather than each maintaining its own copy of the
-      # read/write logic (the reason a file was chosen over browser storage in the first place:
-      # switch-story.ps1 is also a CLI tool, so both need to read the same source of truth).
+      # owner to stg-config.json via stg-paths.psm1's Update-StgConfig - a read-modify-write that
+      # starts from the FULL current config and layers only the changed fields on top, so this
+      # action only has to build the PATCH (which fields actually arrived on the message) rather
+      # than manually seeding every other known field forward first the way the old inline
+      # $newCfg allowlist below this comment used to. That old allowlist had never heard of the
+      # config's 'projects'/'defaults'/'version'/'activeProject' keys (added once multi-project
+      # support landed) and would have silently deleted all of them on every single settings save -
+      # the #1 data-loss risk Update-StgConfig exists to close; Set-StgConfig itself also now
+      # guards against exactly this as a backstop for any caller that bypasses this action.
       # root, if given, must already exist (it has to contain stories.json to be useful) -
       # worktreeRoot/workspaceRoot do not need to exist yet. An empty string for any field clears
       # just that field rather than requiring every field every time.
-      $newCfg = [ordered]@{}
-      foreach ($k in @('root', 'worktreeRoot', 'workspaceRoot', 'branchFormat', 'jiraBaseUrl', 'githubOrg', 'taskNamePrefix', 'owner')) {
-        if ($StgConfig.$k) { $newCfg[$k] = [string]$StgConfig.$k }
-      }
-      if ($StgConfig.repoAliases) { $newCfg['repoAliases'] = $StgConfig.repoAliases }
-      if (@($StgConfig.hiddenApps | Where-Object { $_ }).Count) { $newCfg['hiddenApps'] = @($StgConfig.hiddenApps | Where-Object { $_ }) }
-
+      $patch = @{}
       if ($msg.PSObject.Properties.Name -contains 'root') {
         $r = [string]$msg.root
         if ($r -and -not (Test-Path $r -PathType Container)) {
           Reply @{ ok = $false; error = "root path not found: $r" }; break
         }
-        if ($r) { $newCfg['root'] = $r } else { $newCfg.Remove('root') }
+        $patch['root'] = $r
       }
-      foreach ($k in @('worktreeRoot', 'workspaceRoot', 'branchFormat', 'jiraBaseUrl', 'githubOrg', 'taskNamePrefix', 'owner')) {
-        if ($msg.PSObject.Properties.Name -contains $k) {
-          $v = [string]$msg.$k
-          if ($v) { $newCfg[$k] = $v } else { $newCfg.Remove($k) }
-        }
+      # activeProject: the popup's project dropdown pushes this so the CLI agrees with whichever
+      # project the UI has selected. A plain top-level field - Update-StgConfig's generic patch loop
+      # already handles it correctly (it isn't one of the dual-write-special-cased project/org
+      # fields), the only gap was this action never including it in what it forwards.
+      foreach ($k in @('worktreeRoot', 'workspaceRoot', 'reposRoot', 'branchFormat', 'jiraBaseUrl', 'githubOrg', 'taskNamePrefix', 'owner', 'activeProject')) {
+        if ($msg.PSObject.Properties.Name -contains $k) { $patch[$k] = [string]$msg.$k }
       }
+      # Only added to the patch when truthy - matching the old code's "leave the old one alone"
+      # semantics for repoAliases: Update-StgConfig never touches a key the patch doesn't mention.
       if ($msg.PSObject.Properties.Name -contains 'repoAliases' -and $msg.repoAliases) {
-        $newCfg['repoAliases'] = $msg.repoAliases
+        $patch['repoAliases'] = $msg.repoAliases
       }
-      # Presence-gated, NOT truthy-gated like repoAliases above: repoAliases treats an empty
-      # value as "leave the old one alone", which is wrong for hiddenApps - unhiding the last
-      # hidden app sends an empty array and that MUST actually clear the key, not silently keep
-      # the previous hidden set.
+      # hiddenApps: presence-gated on the INCOMING message (unlike repoAliases above), because
+      # unhiding the last hidden app sends an empty array and that MUST actually clear the key, not
+      # silently keep the previous hidden set. Update-StgConfig's uniform truthy-else-remove rule
+      # does the actual clearing once the (possibly empty) array is in the patch.
       if ($msg.PSObject.Properties.Name -contains 'hiddenApps') {
-        $newHidden = @($msg.hiddenApps | Where-Object { $_ })
-        if ($newHidden.Count) { $newCfg['hiddenApps'] = $newHidden } else { $newCfg.Remove('hiddenApps') }
+        $patch['hiddenApps'] = @($msg.hiddenApps | Where-Object { $_ })
       }
 
       try {
-        Set-StgConfig -Config $newCfg
-        Reply @{ ok = $true; saved = $newCfg }
+        $saved = Update-StgConfig -Patch $patch
+        Reply @{ ok = $true; saved = $saved }
       } catch {
         Reply @{ ok = $false; error = ("could not save settings: " + $_.Exception.Message) }
       }
     }
     'apps' {
       if (-not (Test-RootReady)) { break }
+      # Tracking mode has no app/worktree concept at all - scanning $GRoot for .git directories
+      # would be both wrong (it IS the tracked repo, not a container of app clones) and slow (a
+      # real repo can have many more top-level folders than a worktree-mode root ever would).
+      # Short-circuit before that scan runs at all.
+      if ($PathsInfo.Mode -eq 'tracking') { Reply @{ ok = $true; apps = @(); mode = 'tracking'; appMapFound = $false; appMapPath = $null }; break }
       # Which repos are actually cloned under $GRoot - the ground truth for "can I worktree this
       # app", which app-map.json (the *configured* list) cannot answer on its own. A home base has
       # a .git DIRECTORY, a worktree has a .git FILE, and a story folder has neither, so scanning
@@ -399,9 +672,19 @@ try {
       # $skip instead would make it vanish from $rows entirely and unhide would have nothing to
       # act on.
       $ownFolderName = Split-Path (Split-Path $PSScriptRoot -Parent) -Leaf
-      $skip = @('tools', 'notes', 'temp', '.env-backups', (Split-Path $PathsInfo.WorkspaceDir -Leaf), $ownFolderName)
+      # (Split-Path $PathsInfo.WorktreeRoot -Leaf) / (Split-Path $PathsInfo.ReposRoot -Leaf)
+      # alongside the WorkspaceDir entry - must stay in sync with switch-story.ps1's
+      # Get-HomeBaseApps, same duplication CLAUDE.md already flags for this skip-list. See that
+      # function's comment for why this is belt-and-suspenders, not load-bearing (the .git-directory
+      # check below already excludes a worktree\/repositories\ container naturally).
+      $skip = @('tools', 'notes', 'temp', '.env-backups', (Split-Path $PathsInfo.WorkspaceDir -Leaf), (Split-Path $PathsInfo.WorktreeRoot -Leaf), (Split-Path $PathsInfo.ReposRoot -Leaf), $ownFolderName)
+      # Scan ReposRoot, not $GRoot directly - a dedicated <root>\repositories\ subfolder for a
+      # new-enough project, else $GRoot itself (an existing project with no reposRoot field, via
+      # Resolve-StgPaths' own fallback) - see switch-story.ps1's Get-HomeBaseApps for the full
+      # reasoning behind this split.
+      $GReposRoot = $PathsInfo.ReposRoot
       $rows = @()
-      foreach ($d in (Get-ChildItem -Path $GRoot -Directory -ErrorAction SilentlyContinue)) {
+      foreach ($d in (Get-ChildItem -Path $GReposRoot -Directory -ErrorAction SilentlyContinue)) {
         $name = $d.Name
         if ($skip -contains $name -or $storyKeys.ContainsKey($name)) { continue }
         if (-not (Test-Path (Join-Path $d.FullName '.git') -PathType Container)) { continue }
@@ -439,10 +722,26 @@ try {
       # $msg.apps reads as $null both when the property is absent and when it's JSON null -
       # stg-paths.psm1's own non-strict-mode convention (missing property -> $null), so a plain
       # null check covers both cases without needing -contains here.
+      #
+      # Bug found wiring up P4d's per-project Apps card, fixed here rather than shipping a card
+      # that LOOKS per-project but isn't: this write unconditionally targeted the shared singleton
+      # regardless of $PathsInfo.ProjectId. Fixed once already (a per-project %LOCALAPPDATA% rung),
+      # then fixed AGAIN one rung further out after live testing showed a project's port/start/
+      # health map belongs next to its own stories.json, not split off into the extension's own
+      # appdata folder - see Get-StgAppMapPath's own comment for the full ladder. A resolved
+      # project's write now always targets its OWN root (created there by New-StgProject at
+      # project-creation time, so this is just "open the existing file" in the normal case); the
+      # legacy no-project-context path (Resolve-StgPaths's step-3 fallback, e.g. a config with zero
+      # projects) keeps writing the shared singleton exactly as before.
       if ($null -eq $msg.apps) {
         Reply @{ ok = $false; error = 'setappmap requires an apps object' }; break
       }
-      $userMapPath = Join-Path (Get-StgUserConfigDir) 'app-map.json'
+      $targetProjectId = [string]$PathsInfo.ProjectId
+      $userMapPath = if ($targetProjectId -and $PathsInfo.Project -and $PathsInfo.Project.root) {
+        Join-Path ([string]$PathsInfo.Project.root) 'app-map.json'
+      } else {
+        Join-Path (Get-StgUserConfigDir) 'app-map.json'
+      }
       $bad = @($msg.apps.PSObject.Properties | Where-Object {
         [string]::IsNullOrWhiteSpace($_.Name) -or $_.Name -match '[\\/]'
       } | ForEach-Object { $_.Name })
@@ -472,11 +771,12 @@ try {
         $cleanApps[$p.Name] = $entry
       }
       if ($badPort) { Reply @{ ok = $false; error = "invalid port for $badPort - must be a number" }; break }
-      # pythonSentinel survives from whichever file is currently authoritative (the %LOCALAPPDATA%
-      # copy if it exists, else the shipped template) so a first Settings save doesn't quietly
-      # revert a custom sentinel back to story-env.ps1's own 'fastapi' default.
+      # pythonSentinel survives from whichever file is currently authoritative for THIS project (its
+      # own per-project copy if it already has one, else the shared singleton, else the shipped
+      # template - same ladder Get-StgAppMapPath's read side always used) so a first Settings save
+      # doesn't quietly revert a custom sentinel back to story-env.ps1's own 'fastapi' default.
       $sentinel = 'fastapi'
-      $currentPath = Get-StgAppMapPath
+      $currentPath = Get-StgAppMapPath -Project $targetProjectId
       if (Test-Path $currentPath) {
         try {
           $cur = Get-Content $currentPath -Raw | ConvertFrom-Json
@@ -485,6 +785,11 @@ try {
       }
       $out = [ordered]@{ pythonSentinel = $sentinel; apps = $cleanApps }
       try {
+        # The per-project rung (…\projects\<id>\) may not exist yet on its first save - the shared
+        # singleton's parent (Get-StgUserConfigDir itself) always does by this point, so this is a
+        # no-op there.
+        $mapParent = Split-Path $userMapPath -Parent
+        if (-not (Test-Path $mapParent)) { New-Item -ItemType Directory -Path $mapParent -Force | Out-Null }
         $json = $out | ConvertTo-Json -Depth 10
         # BOM-less, same convention as Set-StgConfig.
         [System.IO.File]::WriteAllText($userMapPath, $json, [System.Text.UTF8Encoding]::new($false))
@@ -508,12 +813,27 @@ try {
         & $add 'stories.json readable' (Test-Path $PathsInfo.StoriesPath) $PathsInfo.StoriesPath 'Create or restore stories.json at the root, or point Root at where it lives.'
         & $add 'StoryLib.psm1' (Test-Path (Join-Path $ScriptsDir 'StoryLib.psm1')) (Join-Path $ScriptsDir 'StoryLib.psm1') 'Should ship with tools\ - re-download/re-clone the extension folder.'
         & $add 'app-map.json' (Test-Path $PathsInfo.AppMapPath) $PathsInfo.AppMapPath 'Optional - without it, story-env.ps1 reports every app "unmapped" (no port/start/health).'
+        # Worktree root / workspace dir: both $null in tracking mode by design (no worktrees, no
+        # .code-workspace concept at all), so only checked for a worktree-mode project - a tracking
+        # project reporting these as failed would be reporting a non-problem. Previously the
+        # Settings diagnostics table showed a checkmark for these rows regardless of whether the
+        # path actually existed on disk (there was no real check backing it at all); this closes
+        # that gap rather than just fixing how the table reads a check that was never there.
+        if ($PathsInfo.Mode -eq 'worktree') {
+          & $add 'Worktree root exists' (Test-Path $PathsInfo.WorktreeRoot) $PathsInfo.WorktreeRoot 'Create the folder, or point Worktree root (Settings) at where it lives.'
+          & $add 'Workspace dir exists' (Test-Path $PathsInfo.WorkspaceDir) $PathsInfo.WorkspaceDir 'Created automatically on first use (switch-story.ps1 new/open) - only a problem if creation itself failed.'
+          & $add 'Repos root exists' (Test-Path $PathsInfo.ReposRoot) $PathsInfo.ReposRoot 'Create the folder, or point Repos root (Settings) at where your app clones actually live.'
+        }
       }
       $gitCmd = Get-Command git -ErrorAction SilentlyContinue
       & $add 'git on PATH' ([bool]$gitCmd) ($gitCmd.Source) 'Install Git for Windows and ensure git.exe is on PATH.'
       $codeCmd = Get-Command code -ErrorAction SilentlyContinue
       & $add 'code (VS Code CLI) on PATH' ([bool]$codeCmd) ($codeCmd.Source) 'Optional - VS Code: Shell Command: Install ''code'' command in PATH.'
-      foreach ($s in @('switch-story.ps1', 'remove-worktree.ps1', 'story-ledger.ps1', 'story-release.ps1', 'story-doctor.ps1', 'story-env.ps1')) {
+      # Kept in sync with setup.ps1's own script list by hand (both comments say so - see CLAUDE.md's
+      # Dev gotchas for the drift this once had: this list used to be missing 3 of setup.ps1's 9
+      # scripts entirely, so a broken/missing story-handover.ps1 or vault-status.ps1 install would
+      # pass this check while genuinely failing at runtime).
+      foreach ($s in @('switch-story.ps1', 'remove-worktree.ps1', 'story-ledger.ps1', 'story-release.ps1', 'story-doctor.ps1', 'story-env.ps1', 'story-handover.ps1', 'story-testplan.ps1', 'story-doc.ps1', 'vault-status.ps1', 'install-agent-skill.ps1')) {
         $p = Join-Path $ScriptsDir $s
         & $add $s (Test-Path $p) $p 'Should ship with tools\ - re-download/re-clone the extension folder.'
       }

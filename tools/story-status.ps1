@@ -39,13 +39,14 @@ param(
   [ValidateSet('early', 'final')] [string]$Tier = 'final',
   [switch]$Json,
   [string]$Root,  # override (native-host\host.ps1 / a Settings-driven root); blank = auto-resolve
+  [string]$Project,  # resolved project id (native-host\host.ps1); blank = active project / legacy resolution
   [Parameter(ValueFromRemainingArguments = $true)] $Extra
 )
 
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'stg-paths.psm1') -Force -DisableNameChecking
-$Paths = Resolve-StgPaths -Root $Root
+$Paths = Resolve-StgPaths -Root $Root -Project $Project
 if ($Paths.NeedsSetup) {
   if ($Json) { [Console]::Out.Write((@{ ok = $false; error = $Paths.Error; needsSetup = $true } | ConvertTo-Json -Compress)) }
   else { Write-Host $Paths.Error -ForegroundColor Red }
@@ -53,7 +54,6 @@ if ($Paths.NeedsSetup) {
 }
 $OrgDefaults    = Get-StgOrgDefaults
 $Root           = $Paths.Root
-$LedgerName     = '.story-ship-state.json'
 $NotesDir       = Join-Path $Root 'notes'
 $LogPath        = Join-Path $NotesDir 'status-log.json'
 $DraftPath      = Join-Path $NotesDir 'eod-draft.md'
@@ -140,7 +140,10 @@ function Get-LedgerNext([string]$S) {
   $lscript = Join-Path $PSScriptRoot 'story-ledger.ps1'
   if (-not (Test-Path -LiteralPath $lscript)) { return $null }
   try {
-    $out = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $lscript next -Story $S -Root $Root -Json
+    # [string]$Paths.ProjectId - ProjectId is $null (not '') in the legacy no-project branch, and a
+    # $null argument is dropped by native-command splatting, leaving a dangling -Project with no
+    # value; casting to [string] passes '' through instead, same as $Root's own empty-string case.
+    $out = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $lscript next -Story $S -Root $Root -Project ([string]$Paths.ProjectId) -Json
     $global:LASTEXITCODE = 0
     $txt = ($out | Out-String).Trim()
     if (-not $txt) { return $null }
@@ -152,9 +155,9 @@ function Get-LedgerNext([string]$S) {
 }
 
 # ---- evidence: the three streams, all filtered to >= $since ------------------------------------
-function Get-LedgerDeltas([string]$S, [datetime]$since) {
+function Get-LedgerDeltas([string]$S, $Node, [datetime]$since) {
   $out = @()
-  $p = Join-Path (Join-Path $Root $S) $LedgerName
+  $p = Get-StgLedgerPath -Paths $Paths -Story $S -Node $Node
   if (-not (Test-Path -LiteralPath $p)) { return @($out) }
   try { $led = Read-JsonFile -Path $p } catch { return @($out) }
   foreach ($pn in @($led.phases)) {
@@ -203,13 +206,21 @@ function Get-CommitDeltas([string]$S, $Node, [datetime]$since) {
 
 # ---- collect -----------------------------------------------------------------------------------
 function Invoke-Collect([datetime]$since) {
-  $reg = Read-Registry -Root $Root
+  $reg = Read-Registry -Root $Root -DocsDir $Paths.DocsDir
   $rows = @()
-  foreach ($k in @($reg.stories.PSObject.Properties.Name)) {
+  # Get-StgNames, not the bare @($reg.stories.PSObject.Properties.Name) idiom - on an empty {}
+  # registry that expression is $null, and @($null) is a one-element array HOLDING $null, so this
+  # loop would run once with $k = $null. Get-LedgerDeltas passes that straight to
+  # Get-StgLedgerPath's Mandatory [string]$Story, which throws on it (see the identical comment in
+  # vault-status.ps1) rather than degrading harmlessly the way the old inline Join-Path did.
+  foreach ($k in (Get-StgNames $reg.stories)) {
     $node = $reg.stories.$k
-    $ledger  = Get-LedgerDeltas $k $since
+    $ledger  = Get-LedgerDeltas $k $node $since
     $logs    = Get-LogDeltas $node $since
     $commits = Get-CommitDeltas $k $node $since
+    # Same worktreeRoot-blind gap Get-StgLedgerPath fixes for the ledger file itself - the story
+    # folder can live under a configured worktreeRoot, not always $Root.
+    $effRoot = if ($node.worktreeRoot) { [string]$node.worktreeRoot } else { $Root }
     $rows += [pscustomobject]@{
       key              = $k
       workstream       = (Get-NodeField $node 'workstream')
@@ -223,7 +234,7 @@ function Invoke-Collect([datetime]$since) {
       workstream_added = (Get-NodeField $node 'workstream_added')
       rel              = (Get-NodeField $node 'rel')
       next             = (Get-LedgerNext $k)
-      present          = (Test-Path -LiteralPath (Join-Path $Root $k))
+      present          = (Test-Path -LiteralPath (Join-Path $effRoot $k))
       ledger           = @($ledger)
       logs             = @($logs)
       commits          = @($commits)
@@ -369,9 +380,9 @@ try {
   switch ($Action) {
 
     'set' {
-      if (-not $Story) { $Story = Resolve-StoryFromPath -Root $Root -Registry (Read-Registry -Root $Root) }
+      if (-not $Story) { $Story = Resolve-StoryFromPath -Root $Root -Registry (Read-Registry -Root $Root -DocsDir $Paths.DocsDir) }
       if (-not $Story) { throw "pass -Story <KEY> (could not infer it from cwd)" }
-      $reg = Read-Registry -Root $Root
+      $reg = Read-Registry -Root $Root -DocsDir $Paths.DocsDir
       $k = Resolve-RegistryKey -Registry $reg -Key $Story
       if (-not $k) { throw (Get-MissingStoryHint -Root $Root -Key $Story) }
       # Decide WHAT changes out here. A scriptblock passed to Invoke-RegistryUpdate gets its own
@@ -387,7 +398,7 @@ try {
       if ($PSBoundParameters.ContainsKey('NextDate'))   { $edits['next_date']  = $NextDate }
       if ($PSBoundParameters.ContainsKey('BlockedBy'))  { $edits['blocked_by'] = $BlockedBy }
       if ($edits.Count) {
-        Invoke-RegistryUpdate -Root $Root -Mutate {
+        Invoke-RegistryUpdate -Root $Root -DocsDir $Paths.DocsDir -Mutate {
           param($r)
           $node = $r.stories.$k
           if (-not $node) { return $false }
@@ -401,14 +412,14 @@ try {
     'note' {
       $body = if ($Text) { $Text } else { $Arg1 }
       if (-not $body) { throw "nothing to note. Usage: story-status.ps1 note ""<text>""" }
-      $reg = Read-Registry -Root $Root
+      $reg = Read-Registry -Root $Root -DocsDir $Paths.DocsDir
       $k = $Story
       if (-not $k) { $k = Resolve-StoryFromPath -Root $Root -Registry $reg }
       if ($k) { $k = Resolve-RegistryKey -Registry $reg -Key $k }
       if ($k) {
         # Story-scoped: reuse the node's existing changelog rather than a second store.
         $key = $k
-        Invoke-RegistryUpdate -Root $Root -Mutate {
+        Invoke-RegistryUpdate -Root $Root -DocsDir $Paths.DocsDir -Mutate {
           param($r)
           $node = $r.stories.$key
           if (-not $node) { return $false }
@@ -461,7 +472,7 @@ try {
       }
       $posted = @($posted | Select-Object -Unique)
       $postedDone = @($postedDone | Select-Object -Unique)
-      $reg = Read-Registry -Root $Root
+      $reg = Read-Registry -Root $Root -DocsDir $Paths.DocsDir
       # Work out membership out here: a Mutate scriptblock gets its own copy of any variable it
       # assigns to, so accumulating these inside it reports an empty list on a write that happened.
       $stamped = @(); $skipped = @()
@@ -472,7 +483,7 @@ try {
         if (@($names | Where-Object { $posted -contains $_ }).Count) { $stamped += $kk } else { $skipped += $kk }
       }
       if ($stamped.Count) {
-        Invoke-RegistryUpdate -Root $Root -Mutate {
+        Invoke-RegistryUpdate -Root $Root -DocsDir $Paths.DocsDir -Mutate {
           param($r)
           foreach ($kk in $stamped) {
             $node = $r.stories.$kk

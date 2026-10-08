@@ -29,7 +29,8 @@ param(
   [switch]$CheckAll,  # read-only: blocker status for EVERY story in stories.json (no $Story needed)
   [switch]$DiscardGenerated, # discard allow-listed generated files (lockfiles / routeTree.gen.ts) before the guardrail
   [switch]$Json,
-  [string]$Root  # override for $PSScriptRoot (native-host\host.ps1's Settings-driven root); blank = today's behavior
+  [string]$Root,  # override for $PSScriptRoot (native-host\host.ps1's Settings-driven root); blank = today's behavior
+  [string]$Project  # resolved project id (native-host\host.ps1); blank = active project / legacy resolution
 )
 
 $ErrorActionPreference = 'Stop'
@@ -84,7 +85,7 @@ function Emit($o) {
 # the full precedence order. This script no longer assumes it physically sits at the data root
 # ($PSScriptRoot is now tools\, alongside every other script).
 Import-Module (Join-Path $PSScriptRoot 'stg-paths.psm1') -Force -DisableNameChecking
-$Paths = Resolve-StgPaths -Root $Root
+$Paths = Resolve-StgPaths -Root $Root -Project $Project
 if ($Paths.NeedsSetup) {
   Emit @{ ok = $false; error = $Paths.Error; needsSetup = $true }
   exit 0
@@ -92,6 +93,9 @@ if ($Paths.NeedsSetup) {
 $Root = $Paths.Root
 $RegistryPath = $Paths.StoriesPath
 $WorkspaceDir = $Paths.WorkspaceDir
+# Where home-base app clones actually live - see switch-story.ps1's identical field for the full
+# reasoning (a dedicated <root>\repositories\ subfolder for a new-enough project, else $Root itself).
+$ReposRoot = $Paths.ReposRoot
 
 # Shared helpers (BOM-less writers, registry lock, git capture, story-key shapes, folder discovery).
 # Deliberately NOT imported here at top level: unlike switch-story.ps1 (which has local fallbacks
@@ -147,17 +151,28 @@ function Add-OrSet($obj, [string]$name, $value) {
 # ledger and MANUAL-TEST.md). Those live in <root>\<STORY> deliberately outside every repo, so they
 # are about to be deleted with the folder - and the ledger is the only record of the phase history.
 # Best-effort: never throws, never blocks removal (worktrees are already gone when this runs).
-function Archive-Story([string]$story, $node, $removed, [string]$storyDir) {
+function Archive-Story([string]$story, $node, $removed, [string]$storyDir, [string]$ledgerPath) {
   try {
-    $HistoryPath = Get-HistoryPath -Root $Root
+    # $Paths.HistoryPath, not Get-HistoryPath -Root $Root - the latter always assumes
+    # <root>\stories_history.json, which is wrong for a tracking-mode project (history lives under
+    # <root>\<docsDir>\ there, same place its stories.json does). $Paths (Resolve-StgPaths' own
+    # result) already computed the mode-correct path once; re-deriving it here via the older,
+    # mode-blind StoryLib helper would silently split tracking-mode history across two locations.
+    $HistoryPath = $Paths.HistoryPath
     $hist = Read-JsonFile -Path $HistoryPath
     # PS collapses a single-element array to a bare object on round-trip - normalize to an array.
     $items = @(); if ($hist -and $hist.removed) { $items = @($hist.removed) }
 
+    # $ledgerPath is resolved by the caller (Get-StgLedgerPath, mode-aware) rather than derived
+    # here from $storyDir - a tracking-mode story has no $storyDir at all (no worktree folder ever
+    # existed), but still has a ledger to archive. $storyDir stays MANUAL-TEST.md-only below: that
+    # artifact is a worktree-mode-only concept (it lives in the story's worktree-root folder),
+    # nothing tracking mode has an equivalent of.
     $ledger = $null; $manual = $null
+    if ($ledgerPath -and (Test-Path -LiteralPath $ledgerPath)) {
+      try { $ledger = Read-JsonFile -Path $ledgerPath } catch { $ledger = 'unreadable' }
+    }
     if ($storyDir -and (Test-Path -LiteralPath $storyDir)) {
-      $lp = Join-Path $storyDir '.story-ship-state.json'
-      if (Test-Path -LiteralPath $lp) { try { $ledger = Read-JsonFile -Path $lp } catch { $ledger = 'unreadable' } }
       $mp = Join-Path $storyDir 'MANUAL-TEST.md'
       if (Test-Path -LiteralPath $mp) {
         try {
@@ -182,7 +197,10 @@ function Archive-Story([string]$story, $node, $removed, [string]$storyDir) {
     $items += [pscustomobject]@{
       key         = $story
       removed_at  = (Get-Stamp)
-      apps        = @($node.apps)
+      # Where-Object { $_ } filters nulls before the @() wrap - a tracking-mode node has no 'apps'
+      # property at all, and @($node.apps) on a missing property is the documented @($null)
+      # one-element-array-of-null trap (CLAUDE.md's dev gotchas), not an empty array.
+      apps        = @($node.apps | Where-Object { $_ })
       removal     = @($removed)
       node        = $node
       ledger      = $ledger
@@ -292,14 +310,17 @@ try {
   if ($CheckAll) {
     $statuses = [ordered]@{}
     if (Test-Path $RegistryPath) {
-      $regAll = Read-Registry -Root $Root
+      $regAll = Read-Registry -Root $Root -DocsDir $Paths.DocsDir
       # Get-StgNames, not @($regAll.stories.PSObject.Properties.Name) - an empty {} registry
       # (fresh install, zero stories) makes that expression $null, and @($null) is a one-element
       # array HOLDING $null, so this would run once with $s = $null and $statuses[$null] = ...
       # throws ("Index operation failed; the array index evaluated to null"). Same bug as the
       # native host's 'apps' action, same fix.
       foreach ($s in (Get-StgNames $regAll.stories)) {
-        $statuses[$s] = Get-StoryStatus $s $regAll.stories.$s
+        # Tracking mode has no worktree/ready-blocked concept at all - na:true tells the popup to
+        # show NO badge rather than a misleading 🟢 (which Get-StoryStatus would otherwise report,
+        # since "zero worktree folders found" and "zero blockers" look identical to it).
+        $statuses[$s] = if ($Paths.Mode -eq 'tracking') { [pscustomobject]@{ na = $true } } else { Get-StoryStatus $s $regAll.stories.$s }
       }
     }
     Emit @{ ok = $true; checkAll = $true; stories = $statuses }
@@ -310,10 +331,57 @@ try {
   # Jira-only regex here is why a slug story switch-story could CREATE could never be removed.
   if (-not (Test-StoryKey $Story)) { Emit @{ ok = $false; error = "invalid story key: $Story" }; return }
 
+  # Tracking mode: no worktrees to guardrail or remove at all - archive the node + ledger straight
+  # to stories_history.json, drop the node, delete the doc file. No -Force/-DiscardGenerated
+  # concept (nothing can be "dirty" - there's no working tree to check), no .code-workspace, no
+  # per-app git status to block on. A short-circuit here, before "discover artifacts" below, since
+  # everything from that point on assumes <root>\<STORY>\<app> worktree folders exist to find.
+  if ($Paths.Mode -eq 'tracking') {
+    if (-not (Test-Path $RegistryPath)) { Emit @{ ok = $false; error = "stories.json not found at $RegistryPath" }; return }
+    $reg = Read-Registry -Root $Root -DocsDir $Paths.DocsDir
+    $resolved = Resolve-RegistryKey -Registry $reg -Key $Story
+    if (-not $resolved) { Emit @{ ok = $false; error = "'$Story' is not in stories.json" }; return }
+    $Story = $resolved
+    $node = $reg.stories.$Story
+
+    if ($CheckOnly) {
+      Emit @{ ok = $true; checkOnly = $true; story = $Story; mode = 'tracking'; blockers = @() }
+      return
+    }
+
+    $ledgerPath = Get-StgLedgerPath -Paths $Paths -Story $Story
+    $archiveStatus = Archive-Story $Story $node @() $null $ledgerPath
+
+    # Same locked read-modify-write every other writer of this file uses (switch-story, story-env
+    # heal, this script's own worktree-mode flow below, the browser host) - never a direct
+    # Write-Registry-style overwrite outside the lock.
+    $key = $Story
+    [void](Invoke-RegistryUpdate -Root $Root -DocsDir $Paths.DocsDir -Mutate {
+      param($r)
+      $k = Resolve-RegistryKey -Registry $r -Key $key
+      if ($k) { $r.stories.PSObject.Properties.Remove($k) }
+      $true
+    })
+
+    $docPath = Get-StgStoryDocPath -Paths $Paths -Story $Story
+    $docStatus = 'already-absent'
+    if (Test-Path $docPath) {
+      try { Remove-Item -LiteralPath $docPath -Force -ErrorAction Stop; $docStatus = 'removed' }
+      catch { $docStatus = "kept ($($_.Exception.Message))" }
+    }
+
+    Emit @{
+      ok = $true; story = $Story; mode = 'tracking'; hasNode = $true; removed = @()
+      node = 'removed'; doc = $docStatus; archived = $archiveStatus; folder = 'n/a (tracking mode)'
+      workspace = 'n/a (tracking mode)'; extras = @(); discarded = @(); branchDeleted = $false
+    }
+    return
+  }
+
   # ---- discover artifacts (node + any <root>\<STORY>\<app> folders on disk) ----
   $reg = $null; $hasNode = $false; $node = $null; $branch = $null
   if (Test-Path $RegistryPath) {
-    $reg = Read-Registry -Root $Root
+    $reg = Read-Registry -Root $Root -DocsDir $Paths.DocsDir
     $resolved = Resolve-RegistryKey -Registry $reg -Key $Story
     if ($resolved) { $Story = $resolved; $hasNode = $true; $node = $reg.stories.$Story; $branch = $node.branch }
   }
@@ -371,7 +439,7 @@ try {
   $removed = @()
   foreach ($app in ($folders.Keys | Sort-Object)) {
     $wt = $folders[$app]
-    $baseDir = Join-Path $Root $app
+    $baseDir = Join-Path $ReposRoot $app
     if (-not (Test-Path $wt)) { $removed += [pscustomobject]@{ app = $app; status = 'already-absent' }; continue }
     $err = $null
     if (Test-Path (Join-Path $baseDir '.git')) {
@@ -402,12 +470,13 @@ try {
   $nodeStatus = if ($hasNode) { 'present' } else { 'already-absent' }
   $archiveStatus = 'skipped'
   if ($failed.Count -eq 0 -and ($hasNode -or (Test-Path -LiteralPath $storyDir))) {
-    $archiveStatus = Archive-Story $Story $node $removed $storyDir
+    $ledgerPath = Get-StgLedgerPath -Paths $Paths -Story $Story -Node $node
+    $archiveStatus = Archive-Story $Story $node $removed $storyDir $ledgerPath
   }
   if ($hasNode -and $failed.Count -eq 0) {
     # Under the registry lock: 5+ writers (switch-story, story-env heal, this, the browser host).
     $key = $Story
-    [void](Invoke-RegistryUpdate -Root $Root -Mutate {
+    [void](Invoke-RegistryUpdate -Root $Root -DocsDir $Paths.DocsDir -Mutate {
       param($r)
       $k = Resolve-RegistryKey -Registry $r -Key $key
       if ($k) { $r.stories.PSObject.Properties.Remove($k) }

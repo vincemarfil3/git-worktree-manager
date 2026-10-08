@@ -37,13 +37,14 @@ param(
   [string]$FinalName,
   [string]$EarlyAt = '01:00',
   [string]$FinalAt = '04:30',
-  [string]$Root  # override (blank = auto-resolve); also baked into each task's -Root argument
+  [string]$Root,  # override (blank = auto-resolve); also baked into each task's -Root argument
+  [string]$Project  # resolved project id (native-host\host.ps1); blank = active project / legacy resolution
 )
 
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'stg-paths.psm1') -Force -DisableNameChecking
-$Paths = Resolve-StgPaths -Root $Root
+$Paths = Resolve-StgPaths -Root $Root -Project $Project
 if ($Paths.NeedsSetup) { throw $Paths.Error }
 $Root   = $Paths.Root
 $Script = Join-Path $PSScriptRoot 'story-status.ps1'

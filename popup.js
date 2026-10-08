@@ -1,5 +1,9 @@
 const $ = (s) => document.querySelector(s);
-const send = (msg) => new Promise((r) => chrome.runtime.sendMessage(msg, r));
+let CURRENT_PROJECT = null; // the selected project's id - threaded into every send() call below
+// One-line fix threads `project` through every existing send() call in this file - none of the
+// ~30 individual call sites below need editing to become project-aware.
+const send = (msg) => new Promise((r) => chrome.runtime.sendMessage({ project: CURRENT_PROJECT, ...msg }, r));
+let PROJECTS = []; // [{id, name, mode, root, needsSetup, error}] from the host's 'projects' action (P3)
 let STATE;
 let STATS = {};
 let CHECK = {};         // { KEY: { ok, blockers:[{app,dirty,unpushed,noUpstream}], present } } from remove-worktree.ps1 -CheckAll
@@ -27,7 +31,7 @@ let linksErr = '';          // inline validation error shown in the editor (no a
 const PHASE_GROUPS = [
   { name: 'Story Up', phases: ['bring-up'] },
   { name: 'Dev Loop', phases: ['plan', 'implement', 'testplan', 'verify', 'typecheck', 'commit-push'] },
-  { name: 'Prep Release', phases: ['release-notes', 'rel-ticket', 'agiletest', 'release-branch', 'release-prs', 'chg', 'deploy'] },
+  { name: 'Release', phases: ['deploy'] },
 ];
 const CLOSED = new Set(['done', 'skipped']);
 const GLYPH = { done: '✓', skipped: '–', failed: '!', running: '▶', pending: '·' };
@@ -84,7 +88,13 @@ function metaChips(key) {
   if (!n) return '';
   const chips = [];
   if (n.env) chips.push(`<span class="chip">${esc(n.env)}</span>`);
-  if (n.rel) chips.push(`<a class="chip link" target="_blank" title="open ${esc(n.rel)}" href="https://vesta.atlassian.net/browse/${encodeURIComponent(n.rel)}">${esc(n.rel)}</a>`);
+  if (n.rel) {
+    // The project's configured Jira base URL (getState, via background.js's getOrgConfig) - not a
+    // hardcoded org domain, which was actively wrong for any project on a different Jira instance.
+    // Fallback only covers STATE not being loaded yet; jiraBaseUrl itself is always a string post-fix.
+    const jiraBase = (STATE && STATE.jiraBaseUrl) || 'https://vesta.atlassian.net';
+    chips.push(`<a class="chip link" target="_blank" title="open ${esc(n.rel)}" href="${esc(jiraBase)}/browse/${encodeURIComponent(n.rel)}">${esc(n.rel)}</a>`);
+  }
   // Singular field plus the plural map are both in use.
   const chg = [n.chg_number, ...(n.chg_numbers && typeof n.chg_numbers === 'object' ? Object.values(n.chg_numbers) : [])].filter(Boolean);
   for (const c of [...new Set(chg)]) chips.push(`<span class="chip">${esc(c)}</span>`);
@@ -155,7 +165,10 @@ function blockerDetail(ck) {
 }
 
 const colorOf = (s) => (s && RB.COLOR_HEX[s.color]) || '#888';
-const story = (key) => STATE.stories.find((x) => x.key === key);
+// Null-safe: a click handler can fire before the first load() resolves (or after a failed one), and
+// every caller of story() ultimately traces back to a raw STATE.stories.find() with no guard - fixed
+// at the source here rather than in each of the many call sites.
+const story = (key) => (STATE && STATE.stories ? STATE.stories.find((x) => x.key === key) : undefined);
 
 // Live per-story group state (open? tab count?).
 async function computeStats(stories) {
@@ -176,13 +189,55 @@ async function computeStats(stories) {
   return stats;
 }
 
+// Populates PROJECTS and re-derives CURRENT_PROJECT from the host's active project every load -
+// there is no independent "just looking" selection anymore (see the .projrow CSS comment in
+// popup.html for why: a live <select> here used to ALSO set global active on every click, which
+// tested as confusing - it looked like a browsable dropdown but instantly committed). The popup is
+// now purely a reflection of whichever project is active; switching happens from Settings' Projects
+// card. Root-independent (host.ps1's 'projects' action, P3), so this renders even on a totally
+// broken install with nothing configured yet. Always called before the rest of load(), since every
+// send() after this point scopes to CURRENT_PROJECT.
+async function loadProjects() {
+  let res;
+  try { res = await send({ type: 'getProjects' }); } catch (e) { res = { ok: false }; }
+  PROJECTS = (res && res.ok && Array.isArray(res.projects)) ? res.projects : [];
+  const validIds = new Set(PROJECTS.map((p) => p.id));
+  const prevProject = CURRENT_PROJECT;
+  CURRENT_PROJECT = (res && res.activeProject && validIds.has(res.activeProject))
+    ? res.activeProject
+    : ((PROJECTS[0] && PROJECTS[0].id) || null);
+  if (prevProject !== null && prevProject !== CURRENT_PROJECT) {
+    // Active project changed elsewhere (Settings) since this popup last loaded - drop every piece
+    // of per-story state from the previous project so nothing from it can bleed into the new one's
+    // view, same guard switchProject() used to apply on an in-popup switch.
+    selectedKey = null;
+    CHECK = {}; NODES = {}; LEDGERS = {}; RELEASED = {}; HEALTH = {};
+  }
+  paintProjectLabel();
+}
+
+function paintProjectLabel() {
+  const label = $('#projLabel');
+  if (!label) return;
+  if (!PROJECTS.length) { label.textContent = 'No project configured'; return; }
+  const cur = PROJECTS.find((p) => p.id === CURRENT_PROJECT);
+  label.textContent = cur ? (cur.name + (cur.needsSetup ? ' ⚠' : '')) : '(unknown project)';
+}
+
+$('#projSwitchLink').addEventListener('click', (e) => { e.preventDefault(); chrome.runtime.openOptionsPage(); });
+
 async function load() {
+  await loadProjects();
   STATE = await send({ type: 'getState' });
   const stories = STATE.stories;
   activeKey = STATE.settings.activeStory || '';
 
   STATS = await computeStats(stories);
   $('#sectionLbl').textContent = `Story groups · ${Object.keys(STATS).length} open`;
+  // A saved rules override (Settings' Advanced) is the one thing a story mutation can't
+  // auto-clear - see background.js's clearProjectOverride comment for why. Surface it here rather
+  // than leaving it silently unclear why a real change doesn't show.
+  $('#overrideNote').hidden = !STATE.overridden;
 
   // Selection (highlight) is just UI: keep last pick → active story → first.
   const valid = new Set(stories.map((s) => s.key));
@@ -201,35 +256,48 @@ async function load() {
 }
 
 // Ask the native host for per-story blocker status, then repaint badges. Silent if the host is
-// absent — badges just don't show and the rest of the popup keeps working.
+// absent — badges just don't show and the rest of the popup keeps working. Guarded against a
+// project switch landing WHILE this is in flight: two projects can share a story key, so a late
+// response painted after the selection moved on could attribute the wrong project's badge to it.
 async function refreshChecks() {
-  try {
-    const res = await send({ type: 'checkWorktrees' });
-    CHECK = (res && res.ok && res.stories) ? res.stories : {};
-  } catch (_) { CHECK = {}; }
+  const forProject = CURRENT_PROJECT;
+  let res;
+  try { res = await send({ type: 'checkWorktrees' }); } catch (_) { res = null; }
+  if (forProject !== CURRENT_PROJECT) return; // stale - a project switch happened mid-flight
+  CHECK = (res && res.ok && res.stories) ? res.stories : {};
   repaint();
 }
 
 // stories.json nodes + every story's ledger. File reads only (no git, no HTTP), so this is cheap
-// enough to run on every popup open.
+// enough to run on every popup open. Same stale-response guard as refreshChecks.
 async function refreshMeta() {
+  const forProject = CURRENT_PROJECT;
   try {
     const [s, l, r] = await Promise.all([
       send({ type: 'getStories' }), send({ type: 'getLedgers' }), send({ type: 'getReleased' }),
     ]);
+    if (forProject !== CURRENT_PROJECT) return;
     NODES = (s && s.ok && s.stories) ? s.stories : {};
     LEDGERS = (l && l.ok && l.ledgers) ? l.ledgers : {};
     RELEASED = (r && r.ok && r.stories) ? r.stories : {};
-  } catch (_) { NODES = {}; LEDGERS = {}; RELEASED = {}; }
+  } catch (_) {
+    if (forProject !== CURRENT_PROJECT) return;
+    NODES = {}; LEDGERS = {}; RELEASED = {};
+  }
   repaint();
 }
 
-// ⚡ — ports + health for ONE story, on demand.
+// ⚡ — ports + health for ONE story, on demand. Guarded the same way refreshChecks/refreshMeta
+// are: the probe can take tens of seconds, long enough for a project switch to land mid-flight,
+// and two projects can share a story key - a late result must never get painted onto a row that
+// might now belong to a different project.
 async function doHealth(key) {
+  const forProject = CURRENT_PROJECT;
   HEALTH[key] = { loading: true, lines: [] };
   repaint();
   let res;
   try { res = await send({ type: 'envStatus', story: key }); } catch (e) { res = { ok: false, error: String(e) }; }
+  if (forProject !== CURRENT_PROJECT) return; // stale - discard
   if (!res || (!res.ok && !res.apps)) {
     const hint = res && res.nativeHostMissing ? ' (native host unreachable)' : '';
     HEALTH[key] = { loading: false, lines: [], err: ((res && (res.error || res.message)) || 'no reply') + hint };
@@ -248,6 +316,9 @@ async function doHealth(key) {
 }
 
 function repaint() {
+  // Guard against a click firing before the first load() resolves (or after a failed one) - repaint
+  // used to assume STATE was always populated by the time anything could call it.
+  if (!STATE) return;
   // Which story the buttons act on is shown by the highlighted row in the list below, so there is
   // no separate 'Selected' chip to paint.
 
@@ -257,10 +328,31 @@ function repaint() {
   if (a) { status.innerHTML = `Auto-route <b>ON</b> → ${a.title}`; status.classList.add('on'); }
   else { status.textContent = 'Auto-route off — select a story and Set active'; status.classList.remove('on'); }
 
+  // Tracking mode has no worktree/app/port concept at all - computed once here (every row in this
+  // list belongs to the same, currently-selected project) rather than per-row, and used below to
+  // skip ⚡/♻ entirely and relabel 📂/hide +Add app (this is what a real change through the tool
+  // - creating/removing a tracking-mode story - always has been: see CLAUDE.md's Projects section).
+  const curProj = PROJECTS.find((p) => p.id === CURRENT_PROJECT);
+  const isTracking = !!curProj && curProj.mode === 'tracking';
+
   // Buttons
   $('#setActive').disabled = !selectedKey || selectedKey === activeKey;
   $('#clearActive').disabled = !activeKey;
+  $('#addAppRow').hidden = isTracking;
   $('#addAppBtn').disabled = !selectedKey;
+  // 📂 keeps working in tracking mode (Open-StoryDoc, switch-story.ps1's own mode branch) - it
+  // opens the story's doc instead of a .code-workspace, so relabel rather than hide it.
+  $('#openWorkspaceBtn').textContent = isTracking ? '📂 Open doc' : '📂 Open workspace';
+  $('#openWorkspaceBtn').title = isTracking
+    ? "Open the selected story's markdown doc in VS Code (creates it first if it doesn't exist yet)"
+    : "Write/refresh the selected story's .code-workspace from its current worktrees and open it in VS Code";
+  // 🛠 Dev workspace: tracking-mode only, sits next to 🧭 Open main workspace - shortened labels
+  // on both so the pair fits side by side in the 328px popup once dev's button is visible.
+  $('#openDevBtn').hidden = !isTracking;
+  $('#openMainBtn').textContent = isTracking ? '🧭 Main workspace' : '🧭 Open main workspace';
+  $('#openMainBtn').title = isTracking
+    ? "Open main_workspace - the whole project folder (DESIGN.md/ROADMAP.md included), no story attached. For planning/brainstorming before you pick or create a story."
+    : "Open this project's main_workspace - every home-base app clone, no story attached. For planning/brainstorming before you pick or create a story.";
 
   // List
   $('#stories').innerHTML = STATE.stories
@@ -273,13 +365,15 @@ function repaint() {
       const tag = isAct ? `<span class="acttag" title="auto-route is routing to this story">active</span>` : '';
 
       // ready / blocked badge from the -CheckAll status (absent until the native host replies).
+      // na:true (tracking mode - remove-worktree.ps1's own -CheckAll branch) means no ready/
+      // blocked concept applies at all, not "blocked with nothing to show" - show no badge.
       const ck = CHECK[st.key];
-      const badge = !ck ? ''
+      const badge = (!ck || ck.na) ? ''
         : ck.ok ? `<span class="rmstat ok" title="clean & pushed — safe to remove">ready</span>`
           : `<span class="rmstat warn" title="${esc(blockerDetail(ck))}">${esc(blockerSummary(ck))}</span>`;
 
       const h = HEALTH[st.key];
-      const healthBtn = `<button class="ico bolt${h && h.loading ? ' busy' : ''}" data-health="${st.key}" title="Check ports + health for this story's apps (probes HTTP — can take a few seconds)">${h && h.loading ? '…' : '⚡'}</button>`;
+      const healthBtn = isTracking ? '' : `<button class="ico bolt${h && h.loading ? ' busy' : ''}" data-health="${st.key}" title="Check ports + health for this story's apps (probes HTTP — can take a few seconds)">${h && h.loading ? '…' : '⚡'}</button>`;
       const rel = isReleased(st.key);
       const relBtn = `<button class="ico rocket${rel ? ' on' : ''}" data-toggle-release="${st.key}" title="${rel ? 'Marked released — click to roll back (unrelease)' : 'Mark this story released (stamps the ledger deploy phase; does NOT remove the worktree)'}">🚀</button>`;
       const linksBtn = `<button class="ico${st.key === armedLinksKey ? ' on' : ''}" data-toggle-links="${st.key}" title="Add/edit custom links (Abstract, Test plan, or anything else)">✎</button>`;
@@ -299,13 +393,17 @@ function repaint() {
         // Delete button lives on the extra line below (sforce) - the row itself just offers a way back out.
         tail = `<button class="ico cancel" data-cancelforce="${st.key}" title="Cancel">✕</button>`;
       } else {
-        const blocked = ck && !ck.ok;
+        // ck.na (tracking mode) is never "blocked" - there's no git guardrail to force past at all,
+        // so it always gets the plain two-step confirm, never the typed-CONFIRM force flow.
+        const blocked = ck && !ck.na && !ck.ok;
         const recycle = discardableStatus(ck)
           ? `<button class="ico recycle" data-discard="${st.key}" title="Only generated files block this — discard them &amp; remove">♻</button>`
           : '';
         const rmTitle = blocked
           ? 'Blocked — click to force-remove (discards uncommitted changes; type CONFIRM)'
-          : 'Remove worktree — its folders, stories.json node + .code-workspace (blocked if uncommitted non-.env changes or unpushed commits)';
+          : isTracking
+            ? 'Remove this tracked story — its doc + stories.json node (archived to history first)'
+            : 'Remove worktree — its folders, stories.json node + .code-workspace (blocked if uncommitted non-.env changes or unpushed commits)';
         tail = `${recycle}<button class="ico danger" data-remove="${st.key}" title="${rmTitle}">🗑</button>`;
       }
 
@@ -805,8 +903,14 @@ async function openAddForm(mode = 'new', key = null) {
   if (addMode === 'add') {
     const n = NODES[key] || {};
     const st = story(key) || {};
-    // Node apps are the iu-spelled folder names getApps reports; fall back to the rule's repos.
-    const apps = asArr(n.apps).length ? asArr(n.apps) : asArr(st.repos).map((r) => (r === 'ganesha-ui-internal-app' ? 'ganesha-iu-internal-app' : r));
+    // Node apps are the on-disk folder names getApps reports; fall back to the rule's repos, which
+    // are display-aliased (repoAliases maps disk-name -> display-name - see rules-core.js's
+    // repoFor()) - so going back to a submittable folder name needs the REVERSE of the project's
+    // actual configured aliases, not a single hardcoded iu/ui pair that was wrong for any project
+    // with different aliases (or none at all).
+    const reverseAlias = {};
+    for (const [disk, display] of Object.entries((STATE && STATE.repoAliases) || {})) reverseAlias[display] = disk;
+    const apps = asArr(n.apps).length ? asArr(n.apps) : asArr(st.repos).map((r) => reverseAlias[r] || r);
     addExistingApps = new Set(apps.filter(Boolean));
     $('#afKey').value = key;
     $('#afEnv').value = n.env || '';
@@ -824,6 +928,16 @@ async function openAddForm(mode = 'new', key = null) {
     $('#afTitleLbl').textContent = '+ New story';
     $('#afMode').hidden = true;
   }
+  // Tracking mode has no env/apps/branch concept at all - hide those fields so the form only asks
+  // for what a tracking-mode story actually needs (key + title + optional Jira link). 'add' mode
+  // (adding an app to an EXISTING story) is unreachable for a tracking-mode project in the first
+  // place (#addAppRow stays hidden - see repaint()), so this only ever applies to 'new'.
+  const curProj = PROJECTS.find((p) => p.id === CURRENT_PROJECT);
+  const isTrackingNew = addMode === 'new' && !!curProj && curProj.mode === 'tracking';
+  $('#afEnv').hidden = isTrackingNew;
+  $('#afBranchRow').hidden = isTrackingNew;
+  $('#afAppsHdr').hidden = isTrackingNew;
+  if (isTrackingNew) { $('#afAppsBody').hidden = true; } // never leave it expanded from a prior worktree-mode session
   $('#mainView').hidden = true;
   $('#addForm').hidden = false;
   addPlan = null;
@@ -871,10 +985,14 @@ function closeAddForm() {
 function afValidate() {
   if (addMode === 'add') return addSelectedApps.size ? null : 'select at least one new app';
   const key = $('#afKey').value.trim();
-  const env = $('#afEnv').value.trim();
-  const branch = $('#afBranch').value.trim();
   if (!key) return 'enter a story key';
   if (!isValidStoryKey(key)) return `invalid key '${key}' — use a Jira key (EH7-9550) or an all-lowercase kebab slug`;
+  // Tracking mode has no env/branch/apps concept at all (the fields are hidden - see
+  // openAddForm) - nothing further to validate once the key itself checks out.
+  const curProj = PROJECTS.find((p) => p.id === CURRENT_PROJECT);
+  if (curProj && curProj.mode === 'tracking') return null;
+  const env = $('#afEnv').value.trim();
+  const branch = $('#afBranch').value.trim();
   if (!env) return 'enter an env (e.g. mint2)';
   if (!branch) return 'enter a branch name';
   if (!isValidBranchName(branch)) return `invalid branch name '${branch}'`;
@@ -1035,39 +1153,78 @@ async function doOpenWorkspace() {
   rmMsg(`✕ ${key}: ${err}${hint}`, 'err');
 }
 $('#openWorkspaceBtn').onclick = doOpenWorkspace;
+
+// Project-wide, no story attached - every home-base app clone (worktree mode) or the single repo
+// (tracking mode). Unlike doOpenWorkspace, this never needs a selectedKey; it acts on whichever
+// project is currently active (CURRENT_PROJECT, threaded in by send() itself).
+async function doOpenMainWorkspace() {
+  rmMsg('Opening main workspace…', '');
+  let res;
+  try { res = await send({ type: 'openMainWorkspace' }); } catch (e) { res = { ok: false, error: String(e) }; }
+  if (res && res.ok) {
+    rmMsg(res.opened ? '✓ Opened main workspace in VS Code' : "✓ main_workspace ready (the 'code' CLI isn't on PATH — open it manually)", 'ok');
+    return;
+  }
+  const err = (res && (res.error || res.message)) || 'unknown error';
+  const hint = res && res.nativeHostMissing ? ' — run native-host\\install-native-host.ps1, then fully restart the browser (see Help)' : '';
+  rmMsg(`✕ main workspace: ${err}${hint}`, 'err');
+}
+$('#openMainBtn').onclick = doOpenMainWorkspace;
+
+// Tracking-mode only - lists just the project's actual git repos, not the whole project folder.
+// Same shape as doOpenMainWorkspace; the host/switch-story.ps1 side returns ok:false cleanly if
+// the active project happens to be worktree mode (the button is hidden there anyway).
+async function doOpenDevWorkspace() {
+  rmMsg('Opening dev workspace…', '');
+  let res;
+  try { res = await send({ type: 'openDevWorkspace' }); } catch (e) { res = { ok: false, error: String(e) }; }
+  if (res && res.ok) {
+    rmMsg(res.opened ? '✓ Opened dev workspace in VS Code' : "✓ dev_workspace ready (the 'code' CLI isn't on PATH — open it manually)", 'ok');
+    return;
+  }
+  const err = (res && (res.error || res.message)) || 'unknown error';
+  const hint = res && res.nativeHostMissing ? ' — run native-host\\install-native-host.ps1, then fully restart the browser (see Help)' : '';
+  rmMsg(`✕ dev workspace: ${err}${hint}`, 'err');
+}
+$('#openDevBtn').onclick = doOpenDevWorkspace;
 $('#opt').onclick = (e) => { e.preventDefault(); chrome.runtime.openOptionsPage(); };
 $('#hist').onclick = (e) => { e.preventDefault(); chrome.tabs.create({ url: chrome.runtime.getURL('history.html') }); window.close(); };
 $('#help').onclick = (e) => { e.preventDefault(); chrome.tabs.create({ url: chrome.runtime.getURL('help.html') }); window.close(); };
 
-$('#loadFile').onclick = async () => {
-  const btn = $('#loadFile');
-  const orig = btn.textContent;
+// The popup's own "⟳ Load stories.json" button (RB.syncSilently(), sharing readAndApply() with
+// Settings' file-picker) used to live here. Removed: it silently pinned a permanent rulesOverride
+// for whichever project was active, which nothing about normal tool use (creating/removing a
+// story) ever cleared - a real bug, confirmed live (two host-confirmed story creations in a row,
+// neither ever showing in the popup, because an override saved earlier via this exact button
+// outlived them both). The identical capability still exists in Settings' Advanced section,
+// explicitly framed there as a native-host-unreachable fallback, not an ambient daily-use control.
+// clearProjectOverride() (background.js) now auto-clears a stale override on every real story
+// mutation; #overrideNote below covers the one remaining legitimate case (a deliberate Settings-
+// side paste, or the host genuinely unreachable) by making it visible instead of silently pinned.
+$('#overrideClear').onclick = async () => {
+  const btn = $('#overrideClear');
   btn.disabled = true;
-  btn.textContent = '⟳ …';
   try {
-    const res = await RB.syncSilently();
-    if (res.needSettings) {
-      chrome.runtime.openOptionsPage();
-      window.close();
-      return;
-    }
+    await send({ type: 'clearRulesOverride' });
     await load();
-    btn.textContent = `✓ ${res.count} stories`;
-    setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1600);
   } catch (e) {
-    btn.textContent = '✕ failed';
-    setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1600);
+    rmMsg(`⚠ Failed to clear override: ${(e && e.message) ? e.message : String(e)}`, 'err');
+  } finally {
+    btn.disabled = false;
   }
 };
 
 // The doctor banner: read-only reconciliation of registry / folders / ledgers. Surfaced here
 // because the drift it finds (an archived story whose folder survived, a node whose ledger is
-// behind, a bare-string apps field) is otherwise only ever discovered as an incident.
+// behind, a bare-string apps field) is otherwise only ever discovered as an incident. Same
+// stale-response guard as refreshChecks/refreshMeta/doHealth.
 async function refreshDoctor() {
   const el = $('#docMsg');
   if (!el) return;
+  const forProject = CURRENT_PROJECT;
   let res;
   try { res = await send({ type: 'runDoctor' }); } catch (_) { return; }
+  if (forProject !== CURRENT_PROJECT) return; // stale - discard
   if (!res || (!res.ok && !res.findings)) { el.textContent = ''; el.className = 'docmsg'; return; }
   const f = asArr(res.findings);
   const errs = f.filter((x) => x.severity === 'error');
@@ -1079,6 +1236,9 @@ async function refreshDoctor() {
   el.className = 'docmsg' + (errs.length ? ' err' : ' warn');
 }
 
-console.log('[stg] popup build: worktree-manager-v12 (the +New story app checklist\'s empty state now shows the native host\'s real error instead of always asking "native host installed, and tools\\app-map.json present?" - both could be true while the host had actually crashed on an empty stories.json; a failed getApps also retries on next open instead of staying stuck for the popup\'s lifetime)');
-load();
+console.log('[stg] popup build: worktree-manager-v20 (tracking mode: new "🛠 Dev workspace" button, next to 🧭 Open main workspace - lists just the actual git repos, not the whole project folder)');
+load().catch((e) => {
+  console.error('[stg] initial load() failed:', e);
+  rmMsg(`⚠ Failed to load: ${(e && e.message) ? e.message : String(e)}`, 'err');
+});
 refreshDoctor();

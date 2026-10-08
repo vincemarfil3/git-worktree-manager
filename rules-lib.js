@@ -87,16 +87,14 @@ window.RB = (() => {
     return readAndApply(handle);
   }
 
-  // Silent sync — no dialog, no prompt (safe for the popup, which closes on focus loss).
-  // Returns { needSettings: true } if there's no remembered file or permission isn't already granted.
-  async function syncSilently() {
-    const handle = await getHandle();
-    if (!handle) return { needSettings: true };
-    if ((await handle.queryPermission({ mode: 'read' })) !== 'granted') return { needSettings: true };
-    return readAndApply(handle);
-  }
+  // syncSilently() (no dialog, popup-safe) used to live here, called only by the popup's own
+  // "Load stories.json" button. Removed with that button: it silently pinned a permanent rules
+  // override for whichever project was active, and nothing about normal tool use (creating a
+  // story) ever cleared it - confirmed live as a real bug. sync() (the file-picker version, used
+  // by Settings' Advanced section) is unaffected - that's a deliberate, explicit action from a
+  // page framed as a native-host-unreachable fallback, not an ambient one-click control.
 
   // jiraKey exported so popup.js's "+ New story" form can auto-fill the key from a pasted Jira
   // URL with the same regex buildRules() already uses - one definition, not two.
-  return { COLOR_HEX, buildRules, getHandle, sync, syncSilently, jiraKey };
+  return { COLOR_HEX, buildRules, getHandle, sync, jiraKey };
 })();

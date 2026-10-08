@@ -6,26 +6,57 @@
     <style>
       :root {
         --bg: #1b1b1f; --bg2: #252529; --bg3: #303039; --line: #34343c;
-        --txt: #ececf1; --sub: #9a9aa6; --accent: #4f8cff; --accent2: #3f73d6; --green: #3aab57;
+        --txt: #ececf1; --sub: #9a9aa6;
+        --accent: #4f8cff; --accent-hover: #3f73d6;
+        /* Text tones for success/warn/danger - each paired with a same-hue-family soft background
+           tint (hand-tuned separately per state below, not derived via color-mix()) rather than the
+           text color itself at low opacity, which read too muddy. --success finally puts the
+           long-orphaned original green to real use instead of leaving it defined and unreferenced. */
+        --success: #4fbd6c; --warn: #d9a441; --danger: #ef7c76;
+        color-scheme: dark;
       }
       * { box-sizing: border-box; }
       body { font: 14px/1.5 system-ui, "Segoe UI", sans-serif; margin: 0; color: var(--txt);
         background: var(--bg); -webkit-font-smoothing: antialiased; }
-      .wrap { max-width: 660px; margin: 0 auto; padding: 28px 20px 60px; }
+      /* Extra left padding opens a gutter for the branch-spine accent below - the max-width bump
+         more than compensates, so card content ends up ~30px WIDER than before (620px -> ~650px),
+         not narrower, which also gives the diagnostics table's mono path column more room. */
+      .wrap { max-width: 720px; margin: 0 auto; padding: 28px 24px 60px 44px; position: relative; }
       header { display: flex; align-items: center; gap: 11px; margin-bottom: 6px; }
       .logo { width: 26px; height: 26px; border-radius: 7px; background: linear-gradient(135deg, #4f8cff, #a65cd6); flex: 0 0 auto; }
-      h1 { font-size: 18px; margin: 0; font-weight: 650; }
+      h1 { font-size: 22px; margin: 0; font-weight: 650; letter-spacing: -.01em; }
       .lead { color: var(--sub); margin: 0 0 22px; font-size: 13px; }
+      a { color: var(--accent); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+
+      /* The one deliberately distinctive structural device on this page: a quiet branch-graph spine
+         in the left gutter, with a small node against every card/details section. Not decoration -
+         it's the same idea the tool itself is built on (one resolved project, many facets branching
+         off it), so every section gets a node on the same line rather than any one card getting its
+         own special color. Soft-faded top/bottom so it never reads as a hard ruled line. */
+      .wrap::before {
+        content: ""; position: absolute; left: 18px; top: 86px; bottom: 60px; width: 1px;
+        background: linear-gradient(to bottom, transparent, rgba(79, 140, 255, .3) 32px, rgba(79, 140, 255, .3) calc(100% - 32px), transparent);
+      }
+      .card, details { position: relative; }
+      .card::before, details::before {
+        content: ""; position: absolute; left: -26px; top: 25px; width: 6px; height: 6px;
+        border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px var(--bg);
+      }
 
       .card { background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; margin-bottom: 18px; }
       .card.hi { border-color: rgba(79, 140, 255, .45); background: linear-gradient(180deg, rgba(79, 140, 255, .08), var(--bg2)); }
-      .card h2 { font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--sub); margin: 0 0 12px; font-weight: 600; }
+      /* Section headers used to be smaller AND dimmer than the body text underneath them (12px grey
+         uppercase vs 12.5px body) - the single biggest hierarchy fix here. Sentence case, page text
+         color, real size: a header that actually reads as one. */
+      .card h2, summary { font-size: 15px; color: var(--txt); font-weight: 600; }
+      .card h2 { margin: 0 0 12px; }
 
       .source { display: flex; align-items: center; gap: 9px; font-size: 13px; flex-wrap: wrap; }
       .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
-      .pill.gen { background: rgba(58, 171, 87, .16); color: #5fd07e; }
+      .pill.gen { background: rgba(58, 171, 87, .16); color: var(--success); }
       .pill.override { background: rgba(79, 140, 255, .16); color: #7aa6ff; }
-      .pill.err { background: rgba(229, 83, 75, .16); color: #ef7c76; }
+      .pill.err { background: rgba(229, 83, 75, .16); color: var(--danger); }
 
       .hostfix { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
       .hostcmd-row { display: flex; gap: 8px; align-items: center; margin: 6px 0; }
@@ -46,21 +77,36 @@
       .note code { background: var(--bg3); padding: 1px 5px; border-radius: 4px; color: #d6d6dd; }
       ol.note { padding-left: 18px; }
       ol.note li { margin: 4px 0; }
+      /* Success/error feedback text - a tiny, additive options.js helper (setMsg) applies these
+         alongside the existing .note class at save/error call sites, so "Saved (check)" and
+         "Error: ..." stop reading as identical grey text. */
+      .note.ok { color: var(--success); }
+      .note.err { color: var(--danger); }
 
-      details { background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; padding: 4px 18px; }
-      summary { cursor: pointer; padding: 12px 0; font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--sub); font-weight: 600; list-style: none; }
+      details { background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; padding: 4px 18px; margin-bottom: 18px; }
+      summary { cursor: pointer; padding: 12px 0; list-style: none; }
       summary::-webkit-details-marker { display: none; }
       summary::before { content: "▸ "; }
       details[open] summary::before { content: "▾ "; }
+      #diagRollup { font-weight: 400; font-size: 13px; color: var(--sub); margin-left: 8px; }
       textarea { width: 100%; height: 240px; font: 12px ui-monospace, monospace; background: var(--bg); color: var(--txt);
-        border: 1px solid var(--line); border-radius: 8px; padding: 10px; resize: vertical; }
+        border: 1px solid var(--line); border-radius: 7px; padding: 10px; resize: vertical; }
       .btns { display: flex; gap: 10px; align-items: center; margin: 4px 0 0; flex-wrap: wrap; }
       .btns.adv { margin: 12px 0 16px; }
-      button { padding: 8px 14px; border-radius: 8px; border: 0; cursor: pointer; font: 600 12.5px system-ui; }
+      button { padding: 8px 14px; border-radius: 7px; border: 0; cursor: pointer; font: 600 12.5px system-ui;
+        transition: background-color .12s ease, border-color .12s ease; }
       button.primary { background: var(--accent); color: #fff; }
-      button.primary:hover { background: var(--accent2); }
+      button.primary:hover { background: var(--accent-hover); }
       button.ghost { background: var(--bg3); color: var(--txt); border: 1px solid var(--line); font-weight: 500; }
+      button.ghost:hover { background: #383842; border-color: #45454f; }
+      /* Remove / Clear override previously looked exactly like Rename / Copy / Recheck - a
+         destructive action shouldn't be visually indistinguishable from a harmless one. */
+      button.danger { background: rgba(229, 83, 75, .14); color: var(--danger); border: 1px solid rgba(229, 83, 75, .35); }
+      button.danger:hover { background: rgba(229, 83, 75, .24); }
       button:disabled { opacity: .5; cursor: not-allowed; }
+      button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, a:focus-visible {
+        outline: 2px solid var(--accent); outline-offset: 2px;
+      }
       #loadMsg, #msg { font-weight: 600; font-size: 12px; }
       .filemeta { color: var(--sub); font-size: 12px; margin-top: 9px; }
 
@@ -70,6 +116,28 @@
         border-radius: 7px; color: var(--txt); font: 12.5px ui-monospace, Consolas, monospace; padding: 7px 10px; }
       .field-row input[type="text"]::placeholder { color: #6b6b76; }
       #cfgMsg, #orgMsg { font-weight: 600; font-size: 12px; }
+      /* CLAUDE.md's documented [hidden]-vs-display trap: .field-row's own `display: flex` has the
+         SAME specificity as the UA's `[hidden] { display: none }` and loads later, so it would win
+         on the tie and toggling .hidden via JS would render nothing. Compounding the attribute onto
+         the class selector raises specificity above the plain .field-row rule. */
+      .field-row[hidden] { display: none; }
+      /* A dashed top border (the same convention .appadd already uses below for "add a new item")
+         gives this its own light frame instead of floating as an unstyled stray line between two
+         cards, while the negative top margin keeps it visually attached to the Projects card it
+         actually describes. */
+      #settingsProjRow { margin: -4px 0 18px; padding-top: 10px; border-top: 1px dashed var(--line); }
+      /* Read-only, like the popup's own #projLabel - deliberately not a selector. "Worktree paths &
+         branch format"/"Organization settings"/"Apps" always edit the ACTIVE project (Set active
+         lives on the Projects card above); an earlier version had an independent "Editing settings
+         for" <select> here, decoupled from active - removed for the same reason the popup's own
+         dropdown was: two different notions of "which project" on one page, only one of which any
+         non-Settings consumer (the popup, a bare CLI run) can see, tested as confusing. */
+      .settingsprojlabel { font-weight: 600; }
+
+      /* Projects card - same re-render-from-state approw idiom as Apps below. */
+      .proj-star { color: var(--success); }
+      .tag.active-flag { background: rgba(58, 171, 87, .16); color: var(--success); }
+      #projectsMsg { font-weight: 600; font-size: 12px; }
 
       table.diag { width: 100%; border-collapse: collapse; font-size: 12.5px; }
       table.diag td { padding: 6px 4px; border-top: 1px solid var(--line); vertical-align: top; }
@@ -77,9 +145,11 @@
       table.diag td.name { color: var(--sub); width: 150px; white-space: nowrap; }
       table.diag td.val { font: 12px ui-monospace, Consolas, monospace; color: #d6d6dd; word-break: break-all; }
       table.diag td.stat { width: 20px; text-align: center; }
-      .ok-y { color: #5fd07e; } .ok-n { color: #ef7c76; }
+      .ok-y { color: var(--success); } .ok-n { color: var(--danger); }
       .src { color: var(--sub); font-size: 11px; margin-left: 6px; }
-      .fixtext { display: block; color: var(--sub); font: 11px system-ui; margin-top: 2px; word-break: break-word; }
+      /* Was the same neutral grey as a passing row's detail text - a fix hint under a FAILING check
+         is not neutral information, so it gets the warn tone instead. */
+      .fixtext { display: block; color: var(--warn); font: 11px system-ui; margin-top: 2px; word-break: break-word; }
 
       /* Apps card - a re-render-from-state list, same idiom as popup.js's app checklist and this
          page's own diagRow()/render(). Deliberately never toggles an element's `hidden` attribute
@@ -90,16 +160,16 @@
       .approw:first-child { border-top: 0; }
       .approw-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 7px; }
       .approw-name { font-weight: 600; font-size: 13px; }
-      .tag.warn { background: rgba(229, 83, 75, .14); color: #ef7c76; }
+      .tag.warn { background: rgba(229, 83, 75, .14); color: var(--danger); }
       .tag.hidden-flag { background: rgba(154, 154, 166, .18); color: var(--sub); }
       .approw-fields { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-      .approw-fields input { background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+      .approw-fields input { background: var(--bg); border: 1px solid var(--line); border-radius: 7px;
         color: var(--txt); font: 12px ui-monospace, Consolas, monospace; padding: 6px 8px; }
       .approw-fields input.f-port { width: 70px; flex: 0 0 auto; }
       .approw-fields input.f-start { flex: 1; min-width: 120px; }
       .approw-fields input.f-health { width: 120px; flex: 0 0 auto; }
       .approw-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
-      button.btn-xs { padding: 4px 9px; font-size: 11.5px; border-radius: 6px; }
+      button.btn-xs { padding: 4px 9px; font-size: 11.5px; border-radius: 7px; }
       .appadd { display: flex; gap: 8px; margin-top: 14px; padding-top: 14px; border-top: 1px dashed var(--line); flex-wrap: wrap; }
       .appadd input { background: var(--bg); border: 1px solid var(--line); border-radius: 7px; color: var(--txt);
         font: 12.5px ui-monospace, Consolas, monospace; padding: 7px 10px; }
@@ -107,8 +177,17 @@
       .appadd input.f-port { width: 70px; flex: 0 0 auto; }
       .appadd input.f-start { flex: 1; min-width: 110px; }
       .appadd input.f-health { width: 110px; flex: 0 0 auto; }
+      select.f-mode { background: var(--bg); border: 1px solid var(--line); border-radius: 7px;
+        color: var(--txt); font: 12.5px system-ui; padding: 7px 10px; flex: 0 0 auto; }
       .appadd + .btns { margin-top: 0; }
       #appsMsg { font-weight: 600; font-size: 12px; }
+
+      @media (max-width: 560px) {
+        .wrap { padding-left: 24px; }
+        .wrap::before, .card::before, details::before { display: none; }
+        .field-row { align-items: flex-start; flex-wrap: wrap; }
+        .field-row label { width: 100%; }
+      }
     </style>
   </head>
   <body>
@@ -119,6 +198,36 @@
       </header>
       <p class="lead">Your stories live in <b>stories.json</b>. This page shows what's loaded and lets you refresh it.
         First time here, or something not working? <a href="#" id="helpLink">Help</a> has a full step-by-step guide.</p>
+
+      <div class="card">
+        <h2>Projects</h2>
+        <p class="note">Each project is its own codebase — its own story root and organization
+          settings. A <b>worktree</b> project also gets its own worktrees and app checklist (the
+          original git-worktree workflow); a <b>tracking</b> project is a repo you work in a single
+          VS Code window — just a story registry and one markdown doc per story living inside that
+          repo, no worktrees or app checklist at all. The popup always shows whichever project is
+          active; the cards below (<b>Worktree paths</b>, <b>Organization settings</b>, <b>Apps</b>)
+          always act on that same active project — <b>Set active</b> above is the only way to change
+          which one (Apps only applies to worktree-mode projects).</p>
+        <div id="projectsList"><div class="note">Loading…</div></div>
+        <div class="appadd">
+          <input type="text" class="f-name" id="projNewName" placeholder="project name" />
+          <input type="text" class="f-start" id="projNewRoot" placeholder="root folder, e.g. C:\repos\my-app" />
+          <select class="f-mode" id="projNewMode" title="worktree: cuts a git worktree per app, like the original workflow. tracking: just a story registry + doc inside this repo, no worktrees.">
+            <option value="worktree">worktree</option>
+            <option value="tracking">tracking</option>
+          </select>
+          <button class="ghost" id="projAddBtn">+ Add project</button>
+        </div>
+        <div class="btns">
+          <span id="projectsMsg" class="note"></span>
+        </div>
+      </div>
+
+      <div class="field-row" id="settingsProjRow" hidden>
+        <label>Editing settings for</label>
+        <span id="settingsProjLabel" class="settingsprojlabel"></span>
+      </div>
 
       <div class="card">
         <h2>Native host</h2>
@@ -145,14 +254,30 @@
         </div>
       </div>
 
-      <div class="card hi">
-        <h2>Sync from stories.json</h2>
-        <p class="note">After you add a story to <code>stories.json</code>, click this — it reads the file and applies the new groups instantly. No terminal, no reload.</p>
-        <div class="btns">
-          <button class="primary" id="loadFile">⟳ Load stories.json</button>
-          <span id="loadMsg" class="note"></span>
+      <div class="card">
+        <h2>Agent integration</h2>
+        <p class="note">Teaches an AI coding agent to drive the active project's story registry
+          directly — list stories, create one, append a work-log entry, advance a ledger phase,
+          mark released — instead of you handing it each command by hand. Scoped to whichever
+          project is currently active (<b><span id="agentProjLabel"></span></b>).</p>
+
+        <div class="field-row">
+          <label for="agentScope">Claude Code</label>
+          <select class="f-mode" id="agentScope">
+            <option value="project">This project only (&lt;root&gt;\.claude\skills\)</option>
+            <option value="user">Every project (%USERPROFILE%\.claude\skills\)</option>
+          </select>
+          <button class="ghost" id="agentInstallBtn">Install</button>
         </div>
-        <div class="filemeta" id="fileMeta"></div>
+        <div id="agentInstallStatus" class="note"></div>
+
+        <div class="btns" style="margin-top:10px">
+          <button class="ghost" id="agentCopyAgentsBtn">Copy AGENTS.md snippet (Codex)</button>
+          <button class="ghost" id="agentCopyInstructionsBtn">Copy instructions (ChatGPT / other)</button>
+        </div>
+        <span id="agentCopyMsg" class="note"></span>
+
+        <div class="note" id="agentDevCycleStatus" style="margin-top:10px"></div>
       </div>
 
       <div class="card">
@@ -160,8 +285,8 @@
         <div class="source" id="source">…</div>
       </div>
 
-      <div class="card">
-        <h2>Paths &amp; diagnostics</h2>
+      <details id="diagDetails">
+        <summary>Paths &amp; diagnostics <span id="diagRollup"></span></summary>
         <p class="note">Every path the native host and <code>tools\</code> scripts actually resolve to right
           now, and where each one came from — so a wrong root shows itself here instead of as a mysterious
           empty popup or a <code>&quot;returned no JSON&quot;</code> error. A failing check names its own
@@ -171,14 +296,15 @@
           <button class="ghost" id="diagRecheck">Re-run preflight</button>
           <span id="diagMsg" class="note"></span>
         </div>
-      </div>
+      </details>
 
       <div class="card">
         <h2>Worktree paths &amp; branch format</h2>
-        <p class="note">Where the native host finds <code>stories.json</code>, where per-story worktrees and
-          the generated <code>.code-workspace</code> files are created, and how a new story's branch name is
-          derived. Leave a field blank to use the default shown as its placeholder — an existing story keeps
-          whatever root it was actually created under even if you change this later.</p>
+        <p class="note">Where the native host finds <code>stories.json</code>, where home-base app clones live,
+          where per-story worktrees and the generated <code>.code-workspace</code> files are created, and how
+          a new story's branch name is derived. Leave a field blank to use the default shown as its
+          placeholder — an existing story keeps whatever root it was actually created under even if you
+          change this later.</p>
         <div class="field-row">
           <label for="cfgRoot">Story root</label>
           <input type="text" id="cfgRoot" placeholder="C:\...\Ganesha" />
@@ -190,6 +316,10 @@
         <div class="field-row">
           <label for="cfgWorkspaceRoot">Workspace dir</label>
           <input type="text" id="cfgWorkspaceRoot" placeholder="auto: <root>'s parent\<rootName>_WorkSpaces" />
+        </div>
+        <div class="field-row">
+          <label for="cfgReposRoot">Repos root</label>
+          <input type="text" id="cfgReposRoot" placeholder="same as Story root" />
         </div>
         <div class="field-row">
           <label for="cfgBranchFormat">Branch format</label>
@@ -238,8 +368,8 @@
           <code>story-env.ps1</code> can manage it — without one it just shows "unmapped". You can
           also map an app that isn't cloned yet, or <b>hide</b> one you never want offered in the
           +&nbsp;New&nbsp;story checklist (it stays listed here, unhide any time). Saved to
-          <code>%LOCALAPPDATA%\story-tab-groups\app-map.json</code>, separate from the
-          <code>tools\</code> copy this ships with.</p>
+          <code>app-map.json</code> in this project's own folder, next to its <code>stories.json</code>
+          — never the <code>tools\</code> copy this ships with.</p>
         <div id="appsList"><div class="note">Loading…</div></div>
         <div class="appadd">
           <input type="text" class="f-name" id="appNewName" placeholder="app name (folder name)" />
@@ -261,13 +391,23 @@
 
       <details>
         <summary>Advanced — other ways to update</summary>
-        <p class="note">Prefer the terminal? Run <code>node gen-rules.mjs</code> in the extension folder, then click reload ⟳ on <code>chrome://extensions</code>.</p>
+        <p class="note"><b>Sync from stories.json</b> — a fallback for when the native host is
+          unreachable (Settings' Rules source card above would otherwise show a stale/empty list
+          with no way to refresh it). stories.json now gets created automatically in a project's own
+          folder the moment you add it, and the native host reads it live, so this manual picker is
+          no longer needed for the normal case.</p>
+        <div class="btns">
+          <button class="ghost" id="loadFile">⟳ Load stories.json</button>
+          <span id="loadMsg" class="note"></span>
+        </div>
+        <div class="filemeta" id="fileMeta"></div>
+        <p class="note" style="margin-top: 14px">Prefer the terminal? Run <code>node gen-rules.mjs</code> in the extension folder, then click reload ⟳ on <code>chrome://extensions</code>.</p>
         <p class="note" style="margin-top: 10px">Or paste a full <code>rules.json</code> below and <b>Save override</b> to apply it now. <b>Clear</b> reverts to the packaged file.</p>
         <textarea id="rules" placeholder="paste rules.json here…"></textarea>
         <div class="btns adv">
           <button class="primary" id="save">Save override</button>
-          <button class="ghost" id="clear">Clear override</button>
-          <span id="msg"></span>
+          <button class="danger" id="clear">Clear override</button>
+          <span id="msg" class="note"></span>
         </div>
       </details>
     </div>

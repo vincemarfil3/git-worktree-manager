@@ -22,9 +22,9 @@
     fail  <phase>   status=failed, record -Message as last_error
     skip  <phase>   status=skipped (deliberately not applicable to this story)
     reset [<phase>] back to pending (one phase, or all when omitted)
-    sync            seed phase status from stories.json node fields (rel -> rel-ticket, etc.)
+    sync            seed phase status from stories.json node fields (document -> plan)
     next            print the RESUME POINTER (see below)
-    tracker         grouped Story Up / Dev Loop / Prep Release checklist (the chat-facing view)
+    tracker         grouped Story Up / Dev Loop / Release checklist (the chat-facing view)
     table           markdown: phase | status | artifacts | links
     show            human digest (default)
 
@@ -49,6 +49,7 @@ param(
   [string]$Message,
   [switch]$Json,
   [string]$Root,  # override (native-host\host.ps1 / a Settings-driven root); blank = auto-resolve
+  [string]$Project,  # resolved project id (native-host\host.ps1); blank = active project / legacy resolution
   # Swallow stray positionals instead of dying with a PositionalParameterNotFound binding error
   # before the try block can produce a JSON frame. Reported as ok:false below.
   [Parameter(ValueFromRemainingArguments = $true)] $Extra
@@ -57,14 +58,13 @@ param(
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'stg-paths.psm1') -Force -DisableNameChecking
-$Paths = Resolve-StgPaths -Root $Root
+$Paths = Resolve-StgPaths -Root $Root -Project $Project
 if ($Paths.NeedsSetup) {
   if ($Json) { [Console]::Out.Write((@{ ok = $false; error = $Paths.Error; needsSetup = $true } | ConvertTo-Json -Compress)) }
   else { Write-Host $Paths.Error -ForegroundColor Red }
   exit 0
 }
 $Root         = $Paths.Root
-$LedgerName   = '.story-ship-state.json'
 $AllowedActions = @('init', 'start', 'done', 'fail', 'skip', 'reset', 'sync', 'next', 'tracker', 'table', 'show')
 
 Import-Module (Join-Path $PSScriptRoot 'StoryLib.psm1') -Force -DisableNameChecking
@@ -72,24 +72,25 @@ Import-Module (Join-Path $PSScriptRoot 'StoryLib.psm1') -Force -DisableNameCheck
 # The lifecycle phases that actually exist today. 'resolve' and 'worktree' are deliberately absent:
 # the ledger lives in the story folder, which does not exist until the worktree is created, so
 # those two are inherently pre-ledger. 'group' drives the tracker view - keep it on every phase.
+#
+# The six org-specific prep-release gates (Jira release-notes gate, SCERN REL ticket, TESTLIB
+# AgileTest case, manual release branch, per-app release PRs, ServiceNow CHG) were dropped when
+# this org's deployment process changed - they no longer describe real work. 'deploy' survives as
+# its own 'Release' group: it's the phase the popup's 🚀 Released toggle stamps by NAME
+# (story-release.ps1's Get-ReleasedInfo/release/unrelease all key off the literal 'deploy'), so it
+# has to keep existing even though it's now the only phase in its group.
 $DefaultPhases = @(
-  @{ name = 'bring-up';        group = 'Story Up';     hint = '/story-up - deps, .env, apps healthy' }
-  @{ name = 'plan';            group = 'Dev Loop';     hint = 'analyze:: / plan:: / artifact (human)' }
-  @{ name = 'implement';       group = 'Dev Loop';     hint = 'the actual change (human)' }
-  @{ name = 'testplan';        group = 'Dev Loop';     hint = '/story-test - MANUAL-TEST.md + AgileTest steps' }
-  @{ name = 'verify';          group = 'Dev Loop';     hint = 'run the manual test plan (human) / /qa' }
-  @{ name = 'typecheck';       group = 'Dev Loop';     hint = 'npx tsc --noEmit / python -m py_compile' }
-  @{ name = 'commit-push';     group = 'Dev Loop';     hint = 'commit + push the feature branch' }
-  @{ name = 'release-notes';   group = 'Prep Release'; hint = 'prep release Gate A - customfield_10217' }
-  @{ name = 'rel-ticket';      group = 'Prep Release'; hint = 'SCERN REL + issue links' }
-  @{ name = 'agiletest';       group = 'Prep Release'; hint = 'prep release Gate B - TESTLIB TestCase + steps' }
-  @{ name = 'release-branch';  group = 'Prep Release'; hint = 'MANUAL - the user creates release/REL-XXXX' }
-  @{ name = 'release-prs';     group = 'Prep Release'; hint = 'gh pr create per app into the release branch' }
-  @{ name = 'chg';             group = 'Prep Release'; hint = 'ServiceNow CHG raised (chg_number on the node)' }
-  @{ name = 'deploy';          group = 'Prep Release'; hint = 'deployed + verified on the target env' }
+  @{ name = 'bring-up';        group = 'Story Up';  hint = '/story-up - deps, .env, apps healthy' }
+  @{ name = 'plan';            group = 'Dev Loop';  hint = 'analyze:: / plan:: / artifact (human)' }
+  @{ name = 'implement';       group = 'Dev Loop';  hint = 'the actual change (human)' }
+  @{ name = 'testplan';        group = 'Dev Loop';  hint = '/story-test - MANUAL-TEST.md + AgileTest steps' }
+  @{ name = 'verify';          group = 'Dev Loop';  hint = 'run the manual test plan (human) / /qa' }
+  @{ name = 'typecheck';       group = 'Dev Loop';  hint = 'npx tsc --noEmit / python -m py_compile' }
+  @{ name = 'commit-push';     group = 'Dev Loop';  hint = 'commit + push the feature branch' }
+  @{ name = 'deploy';          group = 'Release';   hint = 'deployed + verified on the target env' }
 )
 $PhaseNames  = @($DefaultPhases | ForEach-Object { $_.name })
-$GroupOrder  = @('Story Up', 'Dev Loop', 'Prep Release')
+$GroupOrder  = @('Story Up', 'Dev Loop', 'Release')
 
 # A story key can arrive in the third positional slot ('done bring-up EH7-9550'), which is the form
 # the story-ship command documents. Prefer an explicit -Story.
@@ -236,17 +237,17 @@ function Write-TrackerBlock($led, $groups, [string]$next, $openBefore) {
 }
 
 # ---- sync: seed phases from what the stories.json node already proves happened -----------------
-# The node and the ledger drift because most release work is recorded on the node (rel, chg_number,
-# releaseBranch, document) by flows that predate the ledger. This makes the ledger the
+# The node and the ledger can drift because 'plan' work is recorded on the node (document /
+# document_keycloak_setup) by flows that predate the ledger. This makes the ledger the
 # reconciliation point instead of a rule the operator has to remember.
+#
+# The rel-ticket/release-branch/agiletest/chg entries this used to seed from (rel, releaseBranch,
+# agiletest_url(s), chg_number(s)) were removed along with their phases - those node fields, if
+# still present on an old story, are simply no longer read here.
 function Invoke-Sync($led, $node) {
   $seeded = @()
   $map = @(
     @{ phase = 'plan';            value = @($node.document, $node.document_keycloak_setup) }
-    @{ phase = 'rel-ticket';      value = @($node.rel) }
-    @{ phase = 'release-branch';  value = @($node.releaseBranch) }
-    @{ phase = 'agiletest';       value = @($node.agiletest_url) + @(if ($node.agiletest_urls) { $node.agiletest_urls.PSObject.Properties.Value } else { @() }) }
-    @{ phase = 'chg';             value = @($node.chg_number) + @(if ($node.chg_numbers) { $node.chg_numbers.PSObject.Properties.Value } else { @() }) }
   )
   foreach ($m in $map) {
     $vals = @($m.value | Where-Object { $_ -and "$_".Trim() })
@@ -270,7 +271,7 @@ $result = [ordered]@{ ok = $true; action = $Action; story = $null; path = $null;
   warning = $null; groups = @(); phases = @(); summary = '' }
 
 try {
-  $reg = Read-Registry -Root $Root
+  $reg = Read-Registry -Root $Root -DocsDir $Paths.DocsDir
   $S = Resolve-Story $Story $reg
   $result.story = $S
   if (-not (Resolve-RegistryKey -Registry $reg -Key $S)) { throw (Get-MissingStoryHint -Root $Root -Key $S) }
@@ -284,9 +285,22 @@ try {
   # fix, also corrupted whichever script called this one in-process.
   $effRoot = if ($node.worktreeRoot) { [string]$node.worktreeRoot } else { $Root }
   $storyDir = Join-Path $effRoot $S
-  if (-not (Test-Path -LiteralPath $storyDir)) { throw "story folder not found: $storyDir (create the worktree first)" }
-  $ledPath = Join-Path $storyDir $LedgerName
+  # The "worktree must already exist" precondition is worktree-mode only - tracking mode has no
+  # per-story folder concept at all (Get-StgLedgerPath routes its ledger under docsDir instead, see
+  # its own comment), so there is nothing here to check for.
+  if ($Paths.Mode -ne 'tracking' -and -not (Test-Path -LiteralPath $storyDir)) {
+    throw "story folder not found: $storyDir (create the worktree first)"
+  }
+  # Get-StgLedgerPath (stg-paths.psm1) - the shared implementation of the $effRoot idiom just
+  # above, now that vault-status.ps1/story-status.ps1/story-release.ps1/host.ps1's 'ledgers' action
+  # all need the identical computation too. Value is unchanged: same $effRoot, same filename.
+  $ledPath = Get-StgLedgerPath -Paths $Paths -Story $S -Node $node
   $result.path = $ledPath
+  # Create the parent dir rather than assume it exists - true for worktree mode (the $storyDir
+  # check above already guaranteed it), but a tracking-mode project created before this phase
+  # shipped (or one hand-edited into existence) might not have its docsDir folder yet.
+  $ledDir = Split-Path $ledPath -Parent
+  if (-not (Test-Path -LiteralPath $ledDir)) { New-Item -ItemType Directory -Path $ledDir -Force | Out-Null }
 
   $existed = Test-Path -LiteralPath $ledPath
   $led = if ($existed) { Read-JsonFile -Path $ledPath } else { New-Ledger $S $node }

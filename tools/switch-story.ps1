@@ -109,7 +109,7 @@
 [CmdletBinding()]
 param(
   [Parameter(Mandatory, Position = 0)]
-  [ValidateSet('list', 'go', 'new', 'add', 'remove', 'install', 'note', 'log', 'open', 'links')]
+  [ValidateSet('list', 'go', 'new', 'add', 'remove', 'install', 'note', 'log', 'open', 'openmain', 'opendev', 'links')]
   [string]$Command,
 
   [Parameter(Position = 1)] [string]$Story,
@@ -122,6 +122,7 @@ param(
 
   # Settings-page overrides (see FLAGS above). All optional; unset = today's exact behavior.
   [string]$Root,
+  [string]$Project,  # resolved project id (native-host\host.ps1); blank = active project / legacy resolution
   [string]$WorktreeRoot,
   [string]$BranchFormat,
 
@@ -157,7 +158,7 @@ $ErrorActionPreference = 'Stop'
 # precedence order (-Root param > stg-config.json > $env:STG_ROOT > auto-detect - config beats the
 # env var so a long-lived process's frozen environment can never silently outrank Settings).
 Import-Module (Join-Path $PSScriptRoot 'stg-paths.psm1') -Force -DisableNameChecking
-$Paths = Resolve-StgPaths -Root $Root -WorktreeRoot $WorktreeRoot
+$Paths = Resolve-StgPaths -Root $Root -WorktreeRoot $WorktreeRoot -Project $Project
 if ($Paths.NeedsSetup) {
   if ($Json) {
     [Console]::Out.Write((@{ ok = $false; error = $Paths.Error; needsSetup = $true } | ConvertTo-Json -Compress))
@@ -168,6 +169,10 @@ if ($Paths.NeedsSetup) {
 }
 $Root = $Paths.Root
 $WorktreeRoot = $Paths.WorktreeRoot
+# Where home-base app clones actually live - <root>\repositories\ for a new-enough worktree-mode
+# project, else $Root itself (an existing project with no reposRoot field of its own - see
+# Resolve-StgPaths' own fallback). $null in tracking mode, matching WorktreeRoot/WorkspaceDir.
+$ReposRoot = $Paths.ReposRoot
 $DefaultBranchFormat = 'feature/{env}/{key}'
 $RegistryPath = $Paths.StoriesPath
 
@@ -224,7 +229,11 @@ function Write-Utf8NoBom([string]$Path, [string]$Text) {
 # silently discarded a node. Serialize the write behind the shared lock.
 function Write-Registry($reg) {
   $lock = $null
-  if ($StoryLibLoaded) { try { $lock = Enter-RegistryLock -Root $Root } catch { Warn2 $_.Exception.Message } }
+  # -DocsDir so the lock file lives next to the SAME stories.json $RegistryPath below actually
+  # writes to - without it, a tracking-mode project's lock would target <root>\stories.json.lock
+  # (wrong location entirely) while the real write goes to <root>\<docsDir>\stories.json, making
+  # the lock silently protect nothing.
+  if ($StoryLibLoaded) { try { $lock = Enter-RegistryLock -Root $Root -DocsDir $Paths.DocsDir } catch { Warn2 $_.Exception.Message } }
   # Depth 12, matching remove-worktree.ps1 and story-env.ps1. The three writers of this one file
   # used to disagree (10 / 12 / 20); the lowest wins any race to truncate a deep node.
   try { Write-Utf8NoBom $RegistryPath ($reg | ConvertTo-Json -Depth 12) }
@@ -242,12 +251,51 @@ function Write-Registry($reg) {
 function Invoke-LedgerJson([string[]]$LedgerArgs) {
   $lscript = Join-Path $PSScriptRoot 'story-ledger.ps1'
   if (-not (Test-Path -LiteralPath $lscript)) { return $null }
-  $pargs = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $lscript) + $LedgerArgs + @('-Json', '-Root', $Root)
+  # [string]$Paths.ProjectId - see story-release.ps1's Invoke-Ledger for why the cast matters.
+  $pargs = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $lscript) + $LedgerArgs + @('-Json', '-Root', $Root, '-Project', [string]$Paths.ProjectId)
   $out = & powershell.exe @pargs
   $global:LASTEXITCODE = 0
   $txt = ($out | Out-String).Trim()
   if (-not $txt) { return $null }
   try { return ($txt | ConvertFrom-Json) } catch { return $null }
+}
+
+# Tracking mode's counterpart to Invoke-LedgerJson - same reasoning: story-doc.ps1's own -Json
+# output must never share this script's pipeline (a genuinely separate child powershell.exe keeps
+# the two streams apart). Used by Invoke-Note (CLI parity - a human types plain text, this base64-
+# encodes it before forwarding) and Invoke-New's tracking branch (below) for the initial doc.
+function Invoke-StoryDocJson([string[]]$DocArgs) {
+  $dscript = Join-Path $PSScriptRoot 'story-doc.ps1'
+  if (-not (Test-Path -LiteralPath $dscript)) { return $null }
+  $pargs = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $dscript) + $DocArgs + @('-Json', '-Root', $Root, '-Project', [string]$Paths.ProjectId)
+  $out = & powershell.exe @pargs
+  $global:LASTEXITCODE = 0
+  $txt = ($out | Out-String).Trim()
+  if (-not $txt) { return $null }
+  try { return ($txt | ConvertFrom-Json) } catch { return $null }
+}
+
+# Tracking mode's counterpart to Open-StoryWorkspace: there are no worktrees to list as roots, so
+# 'open'/'go' just open the story's own markdown doc directly. Same {workspace;opened} return
+# shape as Open-StoryWorkspace on purpose, so Invoke-Open/Invoke-Go need only a mode branch on
+# WHICH function to call, not a second reply shape to handle.
+function Open-StoryDoc([string]$story) {
+  $docPath = Get-StgStoryDocPath -Paths $Paths -Story $story
+  if (-not (Test-Path $docPath)) {
+    $dir = Split-Path $docPath -Parent
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    Write-Utf8NoBom $docPath "# $story`n`n## Work log`n"
+  }
+  $code = Get-Command code -ErrorAction SilentlyContinue
+  if ($code) {
+    & $code.Source $docPath
+    Say "`nOpened $story's doc in VS Code: $docPath" 'Green'
+  }
+  else {
+    Say "`nDoc ready (the 'code' CLI is not on PATH - open it manually):" 'Yellow'
+    Say "  $docPath" 'White'
+  }
+  [pscustomobject]@{ workspace = $docPath; opened = [bool]$code }
 }
 
 # Terminal output for 'new': in -Json mode write ONLY the compact JSON to stdout (mirrors
@@ -351,6 +399,102 @@ function Open-StoryWorkspace($s, [string]$story) {
   [pscustomobject]@{ workspace = $wsPath; opened = [bool]$code }
 }
 
+# Every home-base app clone under $ReposRoot, no story involved - the "main_workspace" (worktree
+# mode) bundles ALL of them into one window for planning/brainstorming, as opposed to a per-story
+# workspace's one-story subset. $ReposRoot, not $Root directly: for a new-enough project it's a
+# dedicated <root>\repositories\ subfolder; for an existing project with no reposRoot field of its
+# own, Resolve-StgPaths' fallback makes it equal $Root, so this scan is byte-for-byte identical to
+# before for anything that predates this feature. Same ground-truth scan native-host\host.ps1's
+# 'apps' action already uses (a .git DIRECTORY under the scanned folder's top level = a home-base
+# clone; app-map.json is the *configured* list, not proof of what's actually cloned) - duplicated
+# here rather than shared, since host.ps1's version is entangled with story/used-count bookkeeping
+# this doesn't need. If the skip-list below ever changes, host.ps1's own copy (native-host\host.ps1,
+# the 'apps' action) needs the same update to stay in sync - same "two places, must match" caution
+# CLAUDE.md already documents for the generated-files allow-list.
+function Get-HomeBaseApps {
+  $ownFolderName = Split-Path (Split-Path $PSScriptRoot -Parent) -Leaf
+  # (Split-Path $WorktreeRoot -Leaf) / (Split-Path $ReposRoot -Leaf) alongside the pre-existing
+  # WorkspaceDir entry - only matters when $ReposRoot still equals $Root (an existing project),
+  # since a NEW project's dedicated repositories\ folder has no tools\/worktree\/etc. as siblings
+  # to begin with. A dedicated worktree\ container folder already has no .git directly inside it
+  # (nested worktrees are two levels down, and a worktree's .git is a FILE, not a directory), so
+  # the .git-directory check below already excludes it naturally either way - this is
+  # belt-and-suspenders, matching how WorkspaceDir's leaf is already skip-listed rather than relied
+  # on solely via the .git check.
+  $skip = @('tools', 'notes', 'temp', '.env-backups', (Split-Path $WorkspaceDir -Leaf), (Split-Path $WorktreeRoot -Leaf), (Split-Path $ReposRoot -Leaf), $ownFolderName)
+  $apps = @()
+  foreach ($d in (Get-ChildItem -Path $ReposRoot -Directory -ErrorAction SilentlyContinue)) {
+    if ($skip -contains $d.Name) { continue }
+    if (-not (Test-Path (Join-Path $d.FullName '.git') -PathType Container)) { continue }
+    $apps += $d.Name
+  }
+  return $apps
+}
+
+# Path to the project-wide, no-story-attached workspace file (lives in $WorkspaceDir, same as every
+# per-story one). Named main_workspace, not the dead 'full_ui_workspace' story-doctor.ps1 already
+# had a hardcoded exclusion for (nothing anywhere ever created that file, and its original intent -
+# likely UI-specific - is unknown, so this doesn't reuse the name).
+function Get-MainWorkspacePath { Join-Path $WorkspaceDir 'main_workspace.code-workspace' }
+
+# Regenerated fresh every time it's opened (never a stale, hand-maintained list) - always reflects
+# whichever apps are ACTUALLY cloned right now, so a newly-cloned app shows up the very next open
+# with nothing to click. Deliberately never touches any app's current git branch or working-tree
+# state - this is scoped to "which folders show up in the window," nothing else.
+function Write-MainWorkspace {
+  if (-not (Test-Path $WorkspaceDir)) { New-Item -ItemType Directory -Path $WorkspaceDir | Out-Null }
+  $apps = Get-HomeBaseApps
+  if (-not $apps) { throw "No home-base app clones found under $ReposRoot." }
+  $folders = @($apps | ForEach-Object { [pscustomobject]@{ name = $_; path = (Join-Path $ReposRoot $_) } })
+  $rootLeaf = Split-Path $Root -Leaf
+  $wsObj = [pscustomobject]@{
+    folders  = $folders
+    settings = [pscustomobject]@{ 'window.title' = "Planning - $rootLeaf `${separator} `${activeEditorShort}" }
+  }
+  $wsPath = Get-MainWorkspacePath
+  Write-Utf8NoBom $wsPath ($wsObj | ConvertTo-Json -Depth 6)
+  return $wsPath
+}
+
+function Open-MainWorkspace {
+  $wsPath = Write-MainWorkspace
+  $code = Get-Command code -ErrorAction SilentlyContinue
+  if ($code) {
+    & $code.Source $wsPath
+    Say "`nOpened the main workspace in VS Code: $wsPath" 'Green'
+  }
+  else {
+    Say "`nMain workspace ready (the 'code' CLI is not on PATH - open it manually):" 'Yellow'
+    Say "  $wsPath" 'White'
+  }
+  [pscustomobject]@{ workspace = $wsPath; opened = [bool]$code }
+}
+
+# Tracking mode's counterpart to Open-MainWorkspace - just LAUNCHES the existing
+# main_workspace.code-workspace at $Root (there's nothing to regenerate: main_workspace is always
+# '.', the whole project root, since planning needs DESIGN.md/ROADMAP.md which live there -
+# New-StgTrackingScaffold writes this file once, at project-add time, and it never goes stale).
+# $WorkspaceDir is $null in tracking mode by design, so this deliberately does NOT reuse
+# Get-MainWorkspacePath/Write-MainWorkspace, which are keyed off it. Contrast with dev_workspace
+# (Invoke-OpenDev, below) - that one DOES regenerate on every open, because it lists actual repo
+# folders, which can change as you clone more.
+function Open-MainWorkspaceTracking {
+  $wsPath = Join-Path $Root 'main_workspace.code-workspace'
+  if (-not (Test-Path $wsPath)) {
+    throw "main_workspace.code-workspace not found at $wsPath - this should have been created when the project was added. Run tools\setup-dev-loop.ps1 check -Project $($Paths.ProjectId) -Json to see what's missing, then apply."
+  }
+  $code = Get-Command code -ErrorAction SilentlyContinue
+  if ($code) {
+    & $code.Source $wsPath
+    Say "`nOpened the main workspace in VS Code: $wsPath" 'Green'
+  }
+  else {
+    Say "`nMain workspace ready (the 'code' CLI is not on PATH - open it manually):" 'Yellow'
+    Say "  $wsPath" 'White'
+  }
+  [pscustomobject]@{ workspace = $wsPath; opened = [bool]$code }
+}
+
 # Append a timestamped entry to a story's log[] in stories.json. Reloads + saves
 # on its own so it's safe to call after a command has already written the registry.
 function Add-StoryLog([string]$story, [string]$type, [string]$message) {
@@ -403,6 +547,24 @@ function Test-BranchExists([string]$baseDir, [string]$branch) {
   return [bool]((git -C $baseDir branch --list $branch) -or (git -C $baseDir ls-remote --heads origin $branch))
 }
 
+# The repo's actual default branch, not an assumed 'main' - a hardcoded origin/main used to make
+# New-WorktreeFromMain fail outright for any repo whose default branch is actually 'master' (or
+# anything else), a 100%-reproducible-per-app failure confirmed live (git branch -a showed
+# remotes/origin/HEAD -> origin/master, no origin/main at all, so `worktree add -b ... origin/main`
+# had nothing to branch from). Prefers origin/HEAD's own symref, which git itself sets at clone time
+# and reflects whatever the remote's default branch genuinely is regardless of naming convention -
+# falls back to probing the two overwhelmingly common names directly (after the fetch that already
+# just ran) only for a clone that somehow never got origin/HEAD set at all.
+function Get-DefaultBranch([string]$baseDir) {
+  $symref = & git -C $baseDir symbolic-ref -q --short refs/remotes/origin/HEAD 2>$null
+  if ($LASTEXITCODE -eq 0 -and $symref) { return ($symref -replace '^origin/', '') }
+  foreach ($candidate in @('main', 'master')) {
+    & git -C $baseDir rev-parse --verify --quiet "refs/remotes/origin/$candidate" 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) { return $candidate }
+  }
+  return $null
+}
+
 # Reject anything `git worktree add -b <name>` would choke on, so a bad name is one clear error
 # here instead of a cryptic per-app git failure. Not exhaustive vs git-check-ref-format, but covers
 # the shapes that actually bite: whitespace/control chars, '..', the reserved punctuation, leading/
@@ -450,7 +612,7 @@ function Free-BranchFromHome([string]$baseDir, [string]$app, [string]$branch) {
 # branch-already-exists). $wtRoot: see Get-WtPath - pass the story's OWN worktreeRoot when acting
 # on an existing story, or the current -WorktreeRoot when creating a new one.
 function New-WorktreeExisting([string]$app, [string]$story, [string]$branch, [string]$wtRoot = $null) {
-  $baseDir = Join-Path $Root $app
+  $baseDir = Join-Path $ReposRoot $app
   $wt = Get-WtPath $app $story $wtRoot
   if (Test-Path $wt) { Say "  [$app] already at $wt" 'DarkGray'; return }
   if (-not (Test-Path (Join-Path $baseDir '.git'))) { Warn2 "  [$app] no repo at $baseDir - skipping"; return }
@@ -473,17 +635,33 @@ function New-WorktreeExisting([string]$app, [string]$story, [string]$branch, [st
 
 # Cut a NEW branch from origin/main as a worktree (used by new / add-new). $wtRoot: see above.
 function New-WorktreeFromMain([string]$app, [string]$story, [string]$branch, [string]$wtRoot = $null) {
-  $baseDir = Join-Path $Root $app
+  $baseDir = Join-Path $ReposRoot $app
   $wt = Get-WtPath $app $story $wtRoot
   if (Test-Path $wt) { Say "  [$app] already at $wt" 'DarkGray'; return }
   if (-not (Test-Path (Join-Path $baseDir '.git'))) { Warn2 "  [$app] no repo at $baseDir - skipping"; return }
 
   Invoke-Git -C $baseDir fetch origin --quiet
   New-Item -ItemType Directory -Force -Path (Split-Path $wt -Parent) | Out-Null  # ensure <worktreeRoot>\<STORY> exists
-  # Branch ALWAYS from freshly-fetched origin/main, never from whatever is checked out.
-  Invoke-Git -C $baseDir worktree add -b $branch $wt origin/main
+  # Branch ALWAYS from the repo's own actual default branch, freshly fetched - NOT a hardcoded
+  # 'main'. Confirmed live: a repo whose default branch is 'master' (git branch -a showed
+  # remotes/origin/HEAD -> origin/master, no origin/main) made this fail outright, 100% reproducibly,
+  # for every story that touched that app - "registered, but no worktree was created" with no
+  # further detail in the popup. Get-DefaultBranch resolves the real name via origin/HEAD's own
+  # symref (falling back to probing main/master directly) so this works regardless of the app's
+  # naming convention.
+  $baseBranch = Get-DefaultBranch $baseDir
+  if (-not $baseBranch) { throw "  [$app] could not determine the default branch (no origin/HEAD, no origin/main or origin/master) - check 'git remote -v' and 'git branch -a' in $baseDir" }
+  # --no-track: without it, git's own branch.autoSetupMerge default makes a NEW branch cut from a
+  # remote-tracking ref track THAT ref as its upstream - so $branch would end up tracking
+  # origin/$baseBranch instead of a same-named remote branch that doesn't exist yet. A bare
+  # `git push` then refuses with "the upstream branch of your current branch does not match the
+  # name of your current branch" on every single worktree this ever creates, since local/upstream
+  # names never match. --no-track skips setting any upstream at all, so the first `git push` on a
+  # new story branch asks for `--set-upstream` once (the normal, expected new-branch prompt)
+  # instead of that confusing mismatch error every time.
+  Invoke-Git -C $baseDir worktree add --no-track -b $branch $wt "origin/$baseBranch"
   Copy-EnvInto $baseDir $wt $app
-  Say "  [$app] branched $branch from origin/main -> $wt" 'Green'
+  Say "  [$app] branched $branch from origin/$baseBranch -> $wt" 'Green'
   if (-not $NoInstall) { Install-Deps $app $wt }
 }
 
@@ -566,6 +744,9 @@ function Invoke-List {
 
 function Invoke-Go {
   if (-not $Story) { throw "Usage: go <STORY>" }
+  # Tracking mode has no worktrees to ensure - 'go' is purely a worktree-mode concept (per-app
+  # New-WorktreeExisting below). Refuse with a clear pointer to 'open', tracking's real equivalent.
+  if ($Paths.Mode -eq 'tracking') { throw "'go' doesn't apply to a tracking-mode story - use 'open $Story' instead." }
   $reg = Read-Registry
   $s = Get-StoryNode $reg $Story
   Write-Host "`nStory $Story [$($s.env)] - $($s.title)" -ForegroundColor Cyan
@@ -582,7 +763,96 @@ function Invoke-Go {
 }
 
 function Invoke-New {
-  if (-not $Story -or -not $A2 -or -not $A3) {
+  if (-not $Story) { throw "Usage: new <STORY> [<env> <app1,app2,...>]" }
+
+  # Tracking mode: no env/apps/branch/worktree concept at all - just a registry node + a doc file.
+  # A separate, short branch rather than threading mode-checks through the ~110 lines below, since
+  # almost none of the worktree path applies (see P5 plan's own line-range breakdown of what this
+  # skips: branch derivation, the app-map warning, the per-app plan, the git loop, the workspace
+  # write - keeping only the node write, Add-StoryLog and the ledger init, which both modes share).
+  if ($Paths.Mode -eq 'tracking') {
+    # Same key-shape rule as worktree mode - remove-worktree.ps1's archival flow rejects the same
+    # shapes, so a key that couldn't be created here couldn't be torn down there either.
+    if ($Story -notmatch '^[A-Za-z0-9]+-\d+$' -and $Story -notmatch '^[a-z][a-z0-9]*(-[a-z0-9]+)+$') {
+      New-Bail "Invalid story key '$Story'. Use a Jira key (EH7-9550) or an all-lowercase kebab slug (kuber-partner-date)."
+      return
+    }
+    $reg = Read-Registry
+    if ($reg.stories.PSObject.Properties.Name -contains $Story) {
+      New-Bail "Story '$Story' already exists."
+      return
+    }
+    if ($CheckOnly) {
+      Emit @{ ok = $true; checkOnly = $true; story = $Story; mode = 'tracking'; apps = @(); warnings = @($script:JsonWarnings) }
+      return
+    }
+
+    Say "`nNew tracked story $Story`n" 'Cyan'
+
+    $node = [pscustomobject]@{ title = [string]$Title }
+    if ($JiraUrl) { $node | Add-Member -NotePropertyName 'jira_stories' -NotePropertyValue @($JiraUrl) }
+    $reg.stories | Add-Member -NotePropertyName $Story -NotePropertyValue $node
+    Write-Registry $reg
+    Add-StoryLog $Story 'created' 'tracked story registered'
+
+    # Ledger init - identical to worktree mode's own call, same reasoning (child process, see
+    # Invoke-LedgerJson's own comment): phase state should exist from the start, not only once
+    # someone remembers to run the ledger by hand.
+    $ledgerStatus = 'skipped (story-ledger.ps1 not found)'
+    try {
+      $ledRes = Invoke-LedgerJson @('init', '-Story', $Story)
+      if ($null -eq $ledRes) { $ledgerStatus = 'skipped (story-ledger.ps1 not found)' }
+      elseif ($ledRes.ok) { $ledgerStatus = 'initialized' }
+      else { $ledgerStatus = "not initialized: $($ledRes.error)"; Warn2 "  ledger not initialized: $($ledRes.error)" }
+    }
+    catch {
+      $ledgerStatus = "not initialized: $($_.Exception.Message)"
+      Warn2 "  ledger not initialized: $($_.Exception.Message)"
+    }
+
+    # Doc init is a plain local file write, not a child-process call like the ledger needs - there
+    # is no separate -Json-emitting script whose stdout this could collide with here.
+    $docPath = Get-StgStoryDocPath -Paths $Paths -Story $Story
+    $docStatus = 'exists already'
+    try {
+      if (-not (Test-Path $docPath)) {
+        $dir = Split-Path $docPath -Parent
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $heading = if ($Title) { "# $Story - $Title" } else { "# $Story" }
+        Write-Utf8NoBom $docPath "$heading`n`n## Work log`n"
+        $docStatus = 'created'
+      }
+    }
+    catch {
+      $docStatus = "failed: $($_.Exception.Message)"
+      Warn2 "  doc: $($_.Exception.Message)"
+    }
+
+    Say "`nRegistered $Story in stories.json$(if (-not $Title) { ' (title is blank - fill it in if you like)' }).`n" 'Green'
+
+    # -Open follows the same checkbox worktree mode's -Open does, opening the doc directly instead
+    # of a .code-workspace - there are no worktrees to list as roots in tracking mode.
+    $workspaceStatus = 'not requested'
+    if ($Open) {
+      try {
+        $r = Open-StoryDoc $Story
+        $workspaceStatus = $r.workspace
+      }
+      catch {
+        $workspaceStatus = "failed: $($_.Exception.Message)"
+        Warn2 "  doc open: $($_.Exception.Message)"
+      }
+    }
+
+    if ($Json) {
+      Emit @{ ok = $true; story = $Story; mode = 'tracking'; title = [string]$Title; apps = @();
+        created = @(); failed = @(); workspace = $workspaceStatus; doc = $docStatus;
+        ledger = $ledgerStatus; warnings = @($script:JsonWarnings); notes = @($script:JsonNotes) }
+    }
+    return
+  }
+
+  if (-not $A2 -or -not $A3) {
     throw "Usage: new <STORY> <env> <app1,app2,...>"
   }
   $env = $A2
@@ -633,7 +903,7 @@ function Invoke-New {
   # story whose branch survived a prior remove-worktree.ps1 (which keeps branches by default unless
   # -DeleteBranch). Checking here fixes that case and lets an explicit -Branch collide safely too.
   $plan = @(foreach ($app in $apps) {
-    $baseDir = Join-Path $Root $app
+    $baseDir = Join-Path $ReposRoot $app
     $onDisk = Test-Path (Join-Path $baseDir '.git')
     $branchExisted = $onDisk -and (Test-BranchExists $baseDir $branch)
     [pscustomobject]@{ app = $app; onDisk = $onDisk; branchExisted = [bool]$branchExisted }
@@ -675,7 +945,7 @@ function Invoke-New {
   foreach ($p in $plan) {
     $app = $p.app
     try {
-      if (-not $p.onDisk) { throw "no repo at $(Join-Path $Root $app)" }
+      if (-not $p.onDisk) { throw "no repo at $(Join-Path $ReposRoot $app)" }
       if ($p.branchExisted) { New-WorktreeExisting $app $Story $branch $WorktreeRoot }
       else { New-WorktreeFromMain $app $Story $branch $WorktreeRoot }
       $wt = Get-WtPath $app $Story $WorktreeRoot
@@ -737,6 +1007,13 @@ function Invoke-New {
 # button): per-app plan, read-only preview, per-app try/catch, structured result.
 function Invoke-Add {
   if (-not $Story -or -not $A2) { throw "Usage: add <STORY> <app1,app2,...>" }
+  # Tracking mode has no app/worktree concept - New-Bail (not a raw throw) so the popup's "+Add
+  # app" (this command's -Json caller) still gets a clean {ok:false, error} frame instead of an
+  # unhandled-exception dump.
+  if ($Paths.Mode -eq 'tracking') {
+    New-Bail "'add' doesn't apply to a tracking-mode story - there's no app/worktree concept to add to."
+    return
+  }
   $newApps = @($A2.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
   $reg = Read-Registry
   if (-not ($reg.stories.PSObject.Properties.Name -contains $Story)) {
@@ -756,7 +1033,7 @@ function Invoke-Add {
 
   # Per-app plan: cloned? branch already exists? already in this story / already on disk?
   $plan = @(foreach ($app in $newApps) {
-    $baseDir = Join-Path $Root $app
+    $baseDir = Join-Path $ReposRoot $app
     $onDisk = Test-Path (Join-Path $baseDir '.git')
     $branchExisted = $onDisk -and (Test-BranchExists $baseDir $s.branch)
     $present = Test-Path (Get-WtPath $app $Story $s.worktreeRoot)
@@ -781,7 +1058,7 @@ function Invoke-Add {
   foreach ($p in $todo) {
     $app = $p.app
     try {
-      if (-not $p.onDisk) { throw "no repo at $(Join-Path $Root $app)" }
+      if (-not $p.onDisk) { throw "no repo at $(Join-Path $ReposRoot $app)" }
       # New apps join the story's EXISTING worktree root (s.worktreeRoot), not today's -WorktreeRoot.
       if ($p.branchExisted) { New-WorktreeExisting $app $Story $s.branch $s.worktreeRoot }
       else { New-WorktreeFromMain $app $Story $s.branch $s.worktreeRoot }
@@ -825,6 +1102,24 @@ function Invoke-Note {
   if (-not $Story -or -not $A2) { throw 'Usage: note <STORY> "what changed / decision / pending item"' }
   $reg = Read-Registry
   [void](Get-StoryNode $reg $Story)   # validate story exists
+  # Tracking mode: route the note into the story's own doc (story-doc.ps1 append) instead of the
+  # registry's log[] - that's the whole point of the doc file (Claude's work-log for that story),
+  # and 'log $Story' would otherwise never see it. Child-process call (Invoke-StoryDocJson), not
+  # in-process: -TextB64 exists because host.ps1's own 'storydoc' action invokes story-doc.ps1 the
+  # same way, through -File, which strips a raw multi-line/quoted string's quoting - this CLI path
+  # base64-encodes $A2 itself so 'note' shares that one append implementation rather than
+  # duplicating the markdown-formatting logic here. Invoke-Note has no -Json path of its own (see
+  # the dispatch switch), so this is CLI-only parity, not the extension's actual entry point.
+  if ($Paths.Mode -eq 'tracking') {
+    $b64 = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($A2))
+    $res = Invoke-StoryDocJson @('append', '-Story', $Story, '-TextB64', $b64)
+    if ($res -and $res.ok) { Write-Host "`nAppended note to $($res.path).`n" -ForegroundColor Green }
+    else {
+      $err = if ($res) { $res.error } else { 'story-doc.ps1 not found or gave no reply' }
+      Write-Warning "note not appended: $err"
+    }
+    return
+  }
   Add-StoryLog $Story 'note' $A2
   Write-Host "`nLogged note on $Story.`n" -ForegroundColor Green
 }
@@ -912,7 +1207,7 @@ function Invoke-Links {
   }
 
   try {
-    $reg = Invoke-RegistryUpdate -Root $Root -Mutate {
+    $reg = Invoke-RegistryUpdate -Root $Root -DocsDir $Paths.DocsDir -Mutate {
       param($r)
       if (-not ($r.stories.PSObject.Properties.Name -contains $Story)) { return $false }
       $node = $r.stories.$Story
@@ -964,13 +1259,57 @@ function Invoke-Open {
   $reg = Read-Registry
   $s = Get-StoryNode $reg $Story
   Say "`nOpening $Story [$($s.env)] - $($s.title)" 'Cyan'
-  $r = Open-StoryWorkspace $s $Story
+  # Tracking mode opens the story's own doc directly - Open-StoryDoc returns the same
+  # {workspace;opened} shape Open-StoryWorkspace does, so the Emit call below needs no branch.
+  $r = if ($Paths.Mode -eq 'tracking') { Open-StoryDoc $Story } else { Open-StoryWorkspace $s $Story }
   Say ""
   if ($Json) { Emit @{ ok = $true; story = $Story; workspace = $r.workspace; opened = $r.opened } }
 }
 
+# No story involved - opens the project-wide planning workspace. Worktree mode: every home-base
+# app clone, regenerated fresh on every call (Open-MainWorkspace, via $WorkspaceDir). Tracking
+# mode: the single main_workspace.code-workspace New-StgTrackingScaffold wrote once at project-add
+# time (Open-MainWorkspaceTracking) - there's nothing to regenerate, and $WorkspaceDir is $null in
+# this mode by design, so the two paths can't share one function. Originally this refused outright
+# for tracking mode ("doesn't apply") - wrong: the popup's own "Open main workspace" button has no
+# mode gate (both modes get main_workspace per the approved design), so refusing here just broke
+# the button for every tracking-mode project. Caught live via a real click in the actual extension.
+function Invoke-OpenMain {
+  Say "`nOpening the main workspace (no story attached)" 'Cyan'
+  $r = if ($Paths.Mode -eq 'tracking') { Open-MainWorkspaceTracking } else { Open-MainWorkspace }
+  Say ""
+  if ($Json) { Emit @{ ok = $true; workspace = $r.workspace; opened = $r.opened } }
+}
+
+# Tracking-mode only - refuses cleanly for worktree mode, which has no dev_workspace concept at
+# all (a worktree-mode story already gets its own per-story workspace via 'open'). Regenerates
+# dev_workspace.code-workspace from a fresh Get-StgTrackingRepos scan on every call (unlike
+# main_workspace/Open-MainWorkspaceTracking above, which only ever launches the file
+# New-StgTrackingScaffold wrote once) - a newly-cloned repo shows up the very next open, same
+# "always fresh" reasoning worktree mode's own Open-MainWorkspace already follows.
+function Invoke-OpenDev {
+  if ($Paths.Mode -ne 'tracking') {
+    throw "dev_workspace is tracking-mode only - this project is worktree mode. Use 'open <KEY>' for a story's own workspace."
+  }
+  Say "`nOpening the dev workspace (no story attached)" 'Cyan'
+  $wsPath = Write-StgDevWorkspace -Root $Root -ProjectName $Paths.ProjectName
+  $code = Get-Command code -ErrorAction SilentlyContinue
+  if ($code) {
+    & $code.Source $wsPath
+    Say "`nOpened the dev workspace in VS Code: $wsPath" 'Green'
+  }
+  else {
+    Say "`nDev workspace ready (the 'code' CLI is not on PATH - open it manually):" 'Yellow'
+    Say "  $wsPath" 'White'
+  }
+  Say ""
+  if ($Json) { Emit @{ ok = $true; workspace = $wsPath; opened = [bool]$code } }
+}
+
 function Invoke-Install {
   if (-not $Story) { throw "Usage: install <STORY>" }
+  # Tracking mode has no worktrees, so nothing to install into.
+  if ($Paths.Mode -eq 'tracking') { throw "'install' doesn't apply to a tracking-mode story - there are no worktrees to install dependencies into." }
   $reg = Read-Registry
   $s = Get-StoryNode $reg $Story
   Write-Host "`nInstalling deps for $Story`n" -ForegroundColor Cyan
@@ -990,7 +1329,7 @@ function Invoke-Remove {
 
   Write-Host "`nRemoving worktrees for $Story`n" -ForegroundColor Cyan
   foreach ($app in $s.apps) {
-    $baseDir = Join-Path $Root $app
+    $baseDir = Join-Path $ReposRoot $app
     $wt = Get-WtPath $app $Story $s.worktreeRoot
     if (Test-Path $wt) {
       try { Invoke-Git -C $baseDir worktree remove $wt } catch {}
@@ -1022,10 +1361,12 @@ function Invoke-Remove {
 if ($Json) {
   try {
     switch ($Command) {
-      'new'   { Invoke-New }
-      'add'   { Invoke-Add }
-      'open'  { Invoke-Open }
-      'links' { Invoke-Links }
+      'new'     { Invoke-New }
+      'add'     { Invoke-Add }
+      'open'    { Invoke-Open }
+      'openmain' { Invoke-OpenMain }
+      'opendev' { Invoke-OpenDev }
+      'links'   { Invoke-Links }
       default { [Console]::Out.Write((@{ ok = $false; error = "command '$Command' does not support -Json yet" } | ConvertTo-Json -Compress)) }
     }
   }
@@ -1044,6 +1385,8 @@ else {
     'note'    { Invoke-Note }
     'log'     { Invoke-Log }
     'open'    { Invoke-Open }
+    'openmain' { Invoke-OpenMain }
+    'opendev' { Invoke-OpenDev }
     'links'   { Invoke-Links }
   }
 }

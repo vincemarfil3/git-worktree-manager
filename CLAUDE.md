@@ -1,8 +1,12 @@
 # Worktree manager — Chrome/Edge extension
 
 A local, **standalone, self-contained MV3 browser extension** that does two jobs for the worktree
-workflow. It is **not** part of any app repo — it's personal tooling that reads a `stories.json`
-registry (the same file the `tools\switch-story.ps1` CLI manages). "Standalone" specifically means:
+workflow. It is **not** part of any app repo — it's personal tooling that reads one or more
+**projects**, each its own independent `stories.json` registry (the same file the
+`tools\switch-story.ps1` CLI manages) with its own worktree root, apps and Jira/GitHub org settings
+— added in Settings, switched via **Set active** there, with the popup always reflecting whichever
+one is currently active. See [Projects (multi-project support)](#projects-multi-project-support)
+below. "Standalone" specifically means:
 every PowerShell script it needs lives in this extension's own [`tools/`](tools/) folder (nothing
 at a fixed sibling path like a `Ganesha\tools\`), and *where your data actually lives* — the
 `stories.json` root, the worktree root, the workspace dir — is resolved by `tools\stg-paths.psm1`
@@ -43,16 +47,18 @@ works — see [Standalone / portability](#standalone--portability) below.
 |---|---|
 | `manifest.json` | MV3 manifest. Permissions: `tabs`, `tabGroups`, `contextMenus`, `storage`, **`nativeMessaging`**. Declares `icons` + `action.default_icon` (16/32/48/128px, `icons/`). |
 | `icons/` | Toolbar/extensions-page icon, generated from `..\tree.svg` (a 512×512 vtracer-traced SVG — regenerate by re-rendering it at each size if it ever needs to change; the SVG originally had no `viewBox`, which must stay fixed or re-scaling crops instead of scaling). |
-| `background.js` | Service worker. Tab→story matching, auto-route, context menu, and the `onMessage` switch the popup/options talk to (incl. **`removeWorktree`**, **`getHistory`**, **`checkWorktrees`**, **`getReleased`**, **`setReleased`**, **`addWorktree`**, **`checkAddWorktree`**, **`addApps`**, **`checkAddApps`**, **`getApps`**, **`setAppMap`**, **`openWorkspace`**, **`getStgConfig`**, **`setStgConfig`**, **`runPreflight`** → native host). One `NATIVE_HOST` constant (`com.storytabgroups.worktree`) everything sends to — not a literal repeated per call site. `getRules()` auto-builds the story list from the native host's `stories` action when no saved override exists yet (no file picker required on a fresh install) before falling back to the packaged `rules.json`. `importScripts('rules-core.js')` for the shared `buildRules()`. Logs a build marker `[stg-bg] service worker build: …`. |
-| `popup.html` / `popup.js` | The toolbar popup UI. Renders the story list + action icons, per-row **ready/blocked badges** (from `checkWorktrees`), the **✔ released chip**, the **+ New story** creation form — its own full-panel view (`#addForm` replaces `#mainView` while open, not shown alongside the list — a long app checklist would flood the 328px popup otherwise), with a **collapsible, searchable app checklist** inside it (collapsed by default, showing a live "N apps selected" summary; a filter box narrows by app/repo name; an empty-state that surfaces the native host's *actual* error, not a generic "is X present?" guess — see the dev gotcha below) — the **inline two-step 🗑→✓/✕ confirm**, the **♻ discard-generated→✓/✕** flow, the **🚀 released→✓/✕ toggle**, **📂 Open workspace**, and an inline `#rmMsg` status line. Footer links to **History** + Settings. Logs `[stg] popup build: …`. |
+| `background.js` | Service worker. Tab→story matching, auto-route, context menu, and the `onMessage` switch the popup/options talk to (incl. **`removeWorktree`**, **`getHistory`**, **`checkWorktrees`**, **`getReleased`**, **`setReleased`**, **`addWorktree`**, **`checkAddWorktree`**, **`addApps`**, **`checkAddApps`**, **`getApps`**, **`setAppMap`**, **`openWorkspace`**, **`openMainWorkspace`**, **`openDevWorkspace`**, **`getStgConfig`**, **`setStgConfig`**, **`runPreflight`**, **`getProjects`**, **`addProject`**, **`getProjectConfig`**, **`setProjectConfig`**, **`removeProject`**, **`installSkill`** → native host). One `NATIVE_HOST` constant (`com.storytabgroups.worktree`) everything sends to — not a literal repeated per call site. A `sendHost(action, extra)` closure auto-injects `project: msg.project` into every forwarded native message. The rules cache is **per-project** (`rulesCache.projects[id]`, built in one `allstories` round trip; `rulesOverrides` keyed by project id) — tab matching spans every project, only `getState`'s reply scopes to one. `importScripts('rules-core.js')` for the shared `buildRules()`. Logs a build marker `[stg-bg] service worker build: …`. |
+| `popup.html` / `popup.js` | The toolbar popup UI. An always-visible **`#projLabel`** above the controls names whichever project is currently active (with a **Switch project** link to Settings — see [Projects](#projects-multi-project-support)). Renders the story list + action icons, per-row **ready/blocked badges** (from `checkWorktrees`), the **✔ released chip**, the **+ New story** creation form — its own full-panel view (`#addForm` replaces `#mainView` while open, not shown alongside the list — a long app checklist would flood the 328px popup otherwise), with a **collapsible, searchable app checklist** inside it (collapsed by default, showing a live "N apps selected" summary; a filter box narrows by app/repo name; an empty-state that surfaces the native host's *actual* error, not a generic "is X present?" guess — see the dev gotcha below) — the **inline two-step 🗑→✓/✕ confirm**, the **♻ discard-generated→✓/✕** flow, the **🚀 released→✓/✕ toggle**, **📂 Open workspace**, a project-wide **🧭 Open main workspace** button (no story selection needed — see [main_workspace / dev_workspace](#-main_workspace--dev_workspace--planning-discipline)), and an inline `#rmMsg` status line. Footer links to **History** + Settings. Logs `[stg] popup build: …`. |
 | `history.html` / `history.js` | **Story history viewer** (opens in a tab from the popup footer). Reads `stories_history.json` via the native host (`getHistory`) and renders newest-first cards of removed stories — env/REL/CHG/date chips, clickable Jira/REL/AgileTest links, collapsible work-log. Jira base URL comes from `getStgConfig`, not a hardcoded org domain. Logs `[stg-hist] history build: …`. |
-| `options.html` / `options.js` | Settings page — a **native host status card** (pings `com.storytabgroups.worktree` on load, shows ✓/✕, and when disconnected shows the exact `install-native-host.ps1 -ExtensionId <id>` fix command with a Copy button and a Recheck button — can't run the installer itself, see below), a **Paths & diagnostics card** (every resolved path + which rule decided it + a re-runnable preflight, via `runPreflight` → host `preflight`), "Load stories.json" (file-picker sync, now optional), **worktree paths & branch format** (Story root / worktree root / workspace dir / branch format, see below), **organization settings** (Jira base URL / GitHub org / EOD task name / owner / repo aliases — every org-specific literal, configurable), an **Apps card** (add/edit/remove each app's port/start/health, hide/unhide from the +New story checklist — see [Settings: Apps](#settings-apps)), + advanced rules.json paste/override. Logs `[stg-opt] options build: …`. |
+| `options.html` / `options.js` | Settings page — a **Projects card** (list/rename/Set active/Remove/+ Add project) and a read-only **`#settingsProjLabel`** ("Editing settings for") naming whichever project the cards below it act on — always the *active* one; **Set active** on the Projects card is the only way to change it (see [Projects](#projects-multi-project-support)); a **native host status card** (pings `com.storytabgroups.worktree` on load, shows ✓/✕, and when disconnected shows the exact `install-native-host.ps1 -ExtensionId <id>` fix command with a Copy button and a Recheck button — can't run the installer itself, see below), a **collapsible Paths & diagnostics card** (a `<details>`, reusing the same styling as the Advanced section below rather than a plain `.card` — its `<summary>` carries an at-a-glance roll-up, `✓ <project> · all checks passed` or `✕ <project> · N problems: …`, auto-expanding itself when there's a real problem so an error is never one extra click away from being noticed; every resolved path + which rule decided it + a re-runnable preflight, via `runPreflight` → host `preflight` — stays scoped to the *active* project; the Worktree root / Workspace dir rows read a **real** existence check from the host now, not a proxy — see the P6 dev gotcha below), **worktree paths & branch format** (Story root / worktree root / workspace dir / branch format, see below), **organization settings** (Jira base URL / GitHub org / EOD task name / owner / repo aliases — every org-specific literal, configurable), an **Apps card** (add/edit/remove each app's port/start/health, hide/unhide from the +New story checklist — see [Settings: Apps](#settings-apps)), an **Agent integration card** (Install for Claude Code with a user/project scope choice, Copy AGENTS.md snippet for Codex, Copy instructions for ChatGPT — all three share one `installSkill` render call so they can never drift out of sync; read-only dev-cycle harness detection — see [Agent skill](#agent-skill-claude-code--codex--chatgpt)), + an **Advanced** `<details>` (the "Sync from stories.json" file-picker — a native-host-unreachable fallback now that `stories.json` is auto-created per project, no longer the primary flow — plus `node gen-rules.mjs` guidance and the rules.json paste/override). Logs `[stg-opt] options build: …`. |
 | `rules-core.js` | `globalThis.RBCore` — the actual `buildRules()` implementation and its helpers (color hash, label, Jira/AgileTest id regexes, repo aliasing), loaded by `background.js` via `importScripts()` and by `rules-lib.js`/`gen-rules.mjs` for the popup/options pages and the Node CLI. **One implementation, three consumers** — this is what retired the old "must stay mirror images" duplicated-copy comment. |
 | `rules-lib.js` | `window.RB`: thin wrapper over `RBCore.buildRules`, remembers the file handle (IndexedDB), `sync()` (picker) / `syncSilently()` (no dialog, popup-safe). |
 | `gen-rules.mjs` | Node CLI alternative: regenerates `rules.json` from `../stories.json`, loading `rules-core.js` via `node:vm` (it's a plain browser/SW script, not an ES module). |
 | `rules.json` | Packaged fallback rule set (generated, ships empty). Consulted only when there's no saved `rulesOverride` **and** the native host is unreachable — the last-resort fallback, not the primary path anymore. |
 | `native-host/` | The bridge to `tools\*.ps1` — see below. |
 | `tools/` | **Every PowerShell script this extension needs, in one folder** — see [Standalone / portability](#standalone--portability). |
+| `skills/story-tab-groups/SKILL.md` | The day-to-day agent skill source, a template (`{{PROJECT_ID}}`/`{{PROJECT_ROOT}}`/`{{TOOLS_DIR}}` placeholders, plus mode-aware `<!-- MODE:tracking -->`/`<!-- MODE:worktree -->` blocks) rendered/installed by `tools\install-agent-skill.ps1 -Skill story-tab-groups` (the default) — see [Agent skill](#agent-skill-claude-code--codex--chatgpt). |
+| `skills/setup-dev-loop/SKILL.md` | The separate **one-time bootstrap** skill template, rendered/installed the same way via `-Skill setup-dev-loop` — see [main_workspace / dev_workspace](#-main_workspace--dev_workspace--planning-discipline). |
 | `setup.ps1` | One-command bootstrap: installs + verifies the native host end-to-end, finds/asks for the data root, publishes `STG_ROOT`/`STG_TOOLS` env vars, runs a preflight, and (given `-OldExtensionDir`) migrates a prior non-standalone install. `-WhatIf` previews every change without touching anything. |
 
 ## Data flow (stories.json → groups)
@@ -63,9 +69,364 @@ action → `RBCore.buildRules()` (`rules-core.js`, shared by `background.js`, `r
 match:[key, REL, AgileTest issue id, …], repos (apps, `iu`→`ui` quirk, now a configurable alias
 map), links (Jira/GitHub URLs built from the configured `jiraBaseUrl`/`githubOrg`) }`. Matching is
 **title-contains-key**, so renaming a tab group by hand keeps working. This happens automatically
-on cold start — no manual refresh needed. After editing `stories.json` by hand, force an immediate
-refresh via the popup's **⟳ Load stories.json** (or options page, or `node gen-rules.mjs` for a
-build-time snapshot).
+on cold start — no manual refresh needed; the native host is read live on every popup open, so
+editing `stories.json` by hand shows up on the very next open with nothing to click. If the native
+host is ever unreachable, Settings' Advanced section has a file-picker fallback (or
+`node gen-rules.mjs` for a build-time snapshot) — see the dev gotcha below for why this isn't in
+the popup itself anymore.
+
+---
+
+## Projects (multi-project support)
+
+The tool originally assumed **one data root** containing many app clones for a single codebase. Everything
+below this section — worktree removal, story creation, the app checklist, the ready/blocked badges — is now
+**per-project**: one project per codebase, each with its own root, worktree root, workspace dir, branch
+format, apps, and Jira/GitHub org settings, switched via **Set active** on Settings' Projects card instead
+of hand-editing Settings back and forth and losing the other codebase's rules cache every time. The popup
+and Settings' own per-project cards always reflect whichever project is currently active — see below for
+why an earlier design with independent "which project am I looking at" selectors in both places was
+replaced with that single, unified active-project concept after live testing showed it confusing.
+
+- **Schema v2** (`%LOCALAPPDATA%\story-tab-groups\stg-config.json`): `{ version, activeProject,
+  defaults:{...org fields...}, projects:[{id, name, mode, root, worktreeRoot?, workspaceRoot?,
+  branchFormat?, jiraBaseUrl?, githubOrg?, repoAliases?, taskNamePrefix?, owner?, hiddenApps?}], root,
+  worktreeRoot }`. The trailing top-level `root`/`worktreeRoot` are a **derived mirror of the active
+  project**, rewritten on every config write — this is what keeps every legacy/zero-arg reader
+  (`Get-StgOrgDefaults`'s zero-arg path, `Resolve-StgPaths`'s legacy fallback, `getConfig`'s raw fields)
+  working unmodified. A v1 (single-root, no `projects` key) config migrates to v2 **additively** the moment
+  it's read (`ConvertTo-StgConfigV2`, called from every `Get-StgConfig`) — it synthesizes one project from
+  the existing top-level fields without moving or deleting anything, so every pre-multi-project reader keeps
+  working byte-for-byte even before the file is ever rewritten to disk.
+- **Effective value** = `project.<field>` → `defaults.<field>` → the tool's original hardcoded default.
+  `defaults` is a **global fallback layer only, never written by a per-project edit** — `Update-StgProject`/
+  `Update-StgConfig` both write org-field changes into the *active* project's own `projects[]` entry, never
+  into `defaults`, so editing one project's Jira URL can never silently change a different project's
+  fallback value.
+- **`Resolve-StgPaths -Project <id>`** (the resolver every `tools\*.ps1` script and `native-host\host.ps1`
+  call through): explicit `-Project <id>` → that project by id, hard-failing on an unknown id rather than
+  silently falling through → else `-Root <path>` reverse-matched against every project's own root → else the
+  configured active project → else, for a genuinely project-less install, the original single-root chain
+  (`-Root` → config → `$env:STG_ROOT` → auto-detect), completely unchanged. Every script takes `-Project`
+  and threads it through, including six places that forward to a *child* script process (e.g.
+  `story-release.ps1`'s ledger-sync call), so `release -Story X -Project acme` while a *different* project
+  is active still writes to `acme`'s own ledger, not the active project's.
+- **Popup**: an always-visible **`#projLabel`** above the controls names whichever project is currently
+  active, plus a **Switch project** link that opens Settings. There is deliberately no live dropdown here —
+  an earlier version used a `<select>` that doubled as both display and switcher, but selecting an option
+  silently changed the *globally* active project too (the only concept of "active" that exists — a bare CLI
+  run, the EOD digest, and every other non-popup consumer all key off it, so the popup can't have its own
+  independent "just looking" state without that meaning something different depending on which surface you
+  last touched). **Confirmed confusing in real use**, not just in theory — it looked like a browsable
+  dropdown but committed on click with no way to preview another project. Replaced with a plain label; every
+  load re-derives `CURRENT_PROJECT` fresh from the host's current active project (`getProjects`'
+  `activeProject` field), and every async refresh (`refreshChecks`/`refreshMeta`/`doHealth`/`refreshDoctor`)
+  still captures it before its own `await` and discards a stale result if it's changed since — two different
+  projects can legitimately share a Jira key, so this guards against active changing elsewhere (Settings)
+  while the popup happens to be open, painting the wrong project's badges. **Tab matching spans every
+  project** (a project that isn't currently active still auto-routes its own tabs); only the popup's display
+  and actions scope to the active one. The right-click **Add to story group** menu lists every project's
+  stories, prefixed by project name once 2+ projects exist, to disambiguate a shared key.
+- **Settings**: a **Projects card** (above "Native host") lists every project with a rename field, **Set
+  active**, **Remove**, and a **+ Add project** mini-form (name + root + a **mode** selector,
+  `worktree`/`tracking` — see [Tracking mode](#tracking-mode) below for what the second option actually
+  does and why it's a separate section, not just another field). `New-StgProject` also creates the new
+  project's registry (`stories.json` + `app-map.json` for `worktree`, `<docsDir>\stories.json` only for
+  `tracking`) in the project's own root at this point — closing a real, previously-undiscovered gap: a
+  project with no `stories.json` couldn't create its first story at all (`switch-story.ps1`'s
+  `Read-Registry` throws with no fallback), and nothing used to create one for a freshly-added project.
+  **Remove is
+  "unpin," not delete** — it only forgets the config's own reference; `stories.json`, worktrees and the repo
+  itself are never touched. A read-only `#settingsProjLabel` ("Editing settings for") names whichever
+  project the existing **Worktree paths & branch format**, **Organization settings** and **Apps** cards
+  read/write (`getProjectConfig`/`setProjectConfig`, scoped to that project's own id) — always the
+  **active** one; **Paths & diagnostics** is scoped to the same active project, so the whole page edits one
+  consistent project at a time. To edit a *different* project, **Set active** it on the Projects card first.
+  An earlier version had this as an independent `<select>`, decoupled from active, so you could edit a
+  project without switching to it — **removed at the user's request after live testing**, for the same
+  reason the popup's own project `<select>` (above) was replaced with a plain label: two different notions
+  of "which project" on one page, only one of which the popup or a bare CLI run can ever see, tested as
+  genuinely confusing rather than merely inconsistent in theory.
+- **A saved manual rules override** (Options' Advanced paste/picker box — the only place it's reachable
+  from; see the dev gotcha below for why the popup's own copy of this was removed) is **tagged to the
+  project it was saved for** and applies only when that project is selected — it never leaks onto a
+  different one. It's also **automatically cleared the moment a real story mutation happens for that
+  project** (create/add-app/remove/release-toggle/set-links — `background.js`'s `clearProjectOverride()`,
+  called alongside `forceRulesRebuild()` at each of those five cases) — an override is meant as "trust my
+  snapshot," not "stay frozen even through changes I make with this very tool." **Found by live-testing,
+  not design review**: two real, host-confirmed story creations in a row never appeared in the popup,
+  because an override saved earlier (via the popup's now-removed "Load stories.json" button) was still
+  pinned for that project — `forceRulesRebuild()` only ever cleared the *auto-built* cache, a completely
+  separate `chrome.storage.local` key from `rulesOverrides`, so nothing about normal tool use had ever
+  invalidated it. The one remaining legitimate case (a deliberate Settings-side paste, or the host being
+  genuinely unreachable) is surfaced with a small notice in the popup itself (`#overrideNote`, "Showing a
+  saved snapshot, not live data" + an inline Clear button) rather than left for someone to discover by
+  finding "Clear override" buried in Settings.
+- **New `native-host\host.ps1` actions**: `projects` (root-independent listing — renders even on a totally
+  broken install), `allstories` (every project's raw `stories.json` in one native-messaging round trip, so
+  cold start is one call, not N), `addProject` (now reads `mode` from the message, validated against
+  `worktree`/`tracking` rather than trusted wholesale), `getProjectConfig`/`setProjectConfig` (read/write one
+  named project directly, independent of which is active), `removeProject`, `storydoc` (tracking mode's
+  per-story doc — see [Tracking mode](#tracking-mode)). Full list folded into the action inventory below.
+
+## Tracking mode
+
+A second project **mode**, for a repo you work in a single VS Code window with no worktrees at all — the
+"Claude vault" case: Claude records progress on a story as it works, the popup just makes that visible to a
+human. Set via the mode selector on Settings' **+ Add project** form (`worktree` is still the default and
+the only mode an existing project can have without deliberately picking `tracking` at creation time — an
+existing project's mode is **not** editable after creation, since worktrees/ledgers already exist in
+worktree-mode locations for one and converting is a real migration question, not a field edit).
+
+- **No git at all.** No fetch, no branch, no `git worktree add`, no `.code-workspace`. A tracking project's
+  `$Paths.Root` genuinely **is** the tracked repo (`src\`, `node_modules\`, etc. live there), not a container
+  of per-story folders the way a worktree project's root is — so every generated artifact (registry, story
+  doc, ledger, `vault-status.ps1` notes) lives under `<root>\<docsDir>\` (`docsDir` defaults to
+  `.claude\stories`), never scattered loose into the tracked repo's own root where it would pollute `git
+  status`. `Resolve-StgPaths`'s tracking-mode record sets `WorktreeRoot`/`WorkspaceDir` to `$null` — every
+  consumer of either needs a null guard, not just a mode branch (`story-doctor.ps1`'s stale-workspace scan is
+  the one place this actually bit: `Get-ChildItem -LiteralPath $null` throws under `$ErrorActionPreference =
+  'Stop'` regardless of `-ErrorAction`, so it's wrapped in `if ($WorkspaceDir) { ... }`).
+- **`tools\story-doc.ps1`** (`init|append|path|show`) is tracking mode's whole write surface for the
+  per-story markdown doc (`<root>\<docsDir>\<KEY>.md`) — a new file, not an extension of `switch-story.ps1
+  note`: that file is already 50KB+, and a multi-line log entry through a positional arg hits the same
+  `-File` child-process quote-stripping problem `-LinksB64`/`-TextB64` exist for elsewhere in this codebase,
+  so it mirrors that fix (`-TextB64`, base64 of UTF-8 text). `append` is deliberately dumb: ensure a
+  `## Work log` heading exists *somewhere* in the file (add one at EOF if absent), then always append the
+  new timestamped entry at the very end — never inserted mid-document, so anything written above (by hand or
+  by Claude, in an earlier session) survives untouched. `native-host\host.ps1`'s **`storydoc`** action is the
+  extension's real entry point to it (`switch-story.ps1 note`, which has no `-Json` path of its own, stays
+  CLI-only parity, calling `story-doc.ps1` as a child process the same way `Invoke-LedgerJson` already does).
+- **Mode branch points**, everywhere `switch-story.ps1`/`remove-worktree.ps1` have one: `new` skips branch
+  derivation, the app-map warning, the per-app git loop and the workspace write entirely, keeping only the
+  node write, `Add-StoryLog`, the doc init and the ledger init (env/apps are optional positionals in this
+  mode — the popup's tracking-mode "+ New story" form hides env/branch/the app checklist to match); `add`/
+  `go`/`install` all refuse with a clear pointer to what to use instead (`open`, for `go`); `open` opens the
+  markdown doc (`Open-StoryDoc`) instead of the `.code-workspace`. `remove-worktree.ps1` has one short-circuit
+  between key validation and worktree discovery: archive the node + ledger + doc text into
+  `stories_history.json` exactly as worktree mode does, drop the registry node, delete the `.md` file — no
+  folders, no branch, nothing else on disk to touch. `-CheckAll` returns `{na:true}` per tracking-mode story
+  so the popup shows **no** ready/blocked badge rather than a misleadingly-🟢 one (there's no "clean and
+  pushed" concept without git). `story-doctor.ps1` gates every worktree-only finding kind
+  (`node-without-folder`/`app-without-worktree`/`extra-folders`/`no-ledger`/`no-workspace`/etc.) behind
+  `$Paths.Mode -eq 'worktree'`, with a tracking-mode `else` branch checking `no-story-doc` (new finding kind)
+  plus the ledger presence/failed-phase checks (shared with worktree mode, just at the docsDir-based path).
+  `vault-status.ps1` forces `-NoCheck` and renders `-` for the Clean/Apps columns. `host.ps1`'s `apps` action
+  short-circuits to `{apps:[], mode:'tracking'}` **before** its `Get-ChildItem $GRoot` scan — scanning a real
+  repo root for app clones is both meaningless and slow. `story-handover.ps1` (moves artifacts between two
+  story *keys*) is deliberately **not** mode-branched — its actual functionality doesn't make sense without
+  worktrees to move, so it stays worktree-only and out of scope rather than growing a tracking-mode path
+  nothing would ever exercise.
+- **Three real bugs found live-testing this mode, none of them hypothetical:**
+  1. **`Get-Content -Raw`'s return value carries PowerShell's extended type-system members** (`PSPath`,
+     `PSParentPath`, `PSChildName`, `PSDrive`, `PSProvider`, `ReadCount`) even though its declared .NET type
+     is a plain `System.String` — a well-known but easy-to-forget PowerShell quirk. `ConvertTo-Json -Depth 8`
+     doesn't see a string then; it sees an object with those properties and recurses *into* them, including
+     `PSDrive`/`PSProvider`'s own large framework-internal object graphs. Not an infinite loop, but slow
+     enough to be indistinguishable from a hang in practice — confirmed by isolated testing: the identical
+     hashtable serialized instantly once the content came from `[System.IO.File]::ReadAllText` instead (a
+     genuinely plain .NET string with no ETS decoration), but never returned within 30s from `Get-Content
+     -Raw`'s decorated one. This is exactly what `story-doc.ps1`'s `show` action hit on its first live test —
+     fixed there (and in `append`, for consistency, though `append`'s own string-interpolation into `$final`
+     happened to already dodge it). **The standing rule this leaves**: never pass a `Get-Content -Raw` result
+     directly into `ConvertTo-Json` — either reinterpolate it into a new string (`"$x"`, which forces a
+     genuinely new String with no ETS wrapper) or read the file with `[System.IO.File]::ReadAllText` in the
+     first place. An explicit `[string](...)` cast *also* works (confirmed empirically — `host.ps1`'s
+     `getHistory`/`ledgers`-adjacent actions were already doing this correctly, apparently by convention
+     rather than by accident), but a bare `Get-Content -Raw` assignment does not, even though
+     `.GetType().FullName` on the result reports `System.String` — the ETS wrapper survives a `.GetType()`
+     check because `ConvertTo-Json` walks `PSObject.Properties`, not the declared CLR type.
+  2. **`host.ps1`'s `storydoc` case read `$msg.action` for the doc sub-action** (`init`/`append`/`path`/
+     `show`) — but `$msg.action` is already consumed by the outer `switch ($msg.action)` that routed the
+     message to this case in the first place, so it always evaluated to the literal string `"storydoc"`,
+     never what the caller actually asked for. Every single call was guaranteed to fail with `"invalid
+     storydoc action: storydoc"` regardless of input — this shipped broken and was never callable until
+     caught here. Fixed by renaming the field to **`docAction`**, distinct from the dispatch-level `action`.
+  3. **The `@($null)`-on-empty-array trap (documented below) recurred inside `story-doctor.ps1`,
+     independently, twice**, in code that predates tracking mode and affects every project regardless of
+     mode: (a) the whole-registry `thin-history-record` check does `foreach ($e in @($hist.removed))` with
+     no `if (-not $e) { continue }` guard — unlike the *sibling* `log-shape` loop two blocks up, which
+     already has exactly that guard — so any project whose `stories_history.json` doesn't exist yet or has
+     no `removed` key (i.e. every project before its first-ever removal) got a phantom `info`-level
+     `thin-history-record` finding with an empty story key, every single run. (b) the `no-apps` finding
+     (`error` severity) was never gated behind `$Paths.Mode -eq 'worktree'` the way every *other*
+     worktree-only finding in the same function is — so it fired as a permanent, unfixable `error` on every
+     tracking-mode story ever created (there is no "app list" to add in a mode with no apps at all). Both
+     fixed; `story-doctor.ps1` now reports `ok:true, findings:[]` for a clean tracking-mode project with no
+     history, instead of `ok:false` with one spurious error and one spurious info finding.
+
+Verified end-to-end via a short-path scratch fixture (`C:\temp\stg-p5\...` — the session scratchpad's own
+deep nesting hit Windows' 260-character `MAX_PATH` limit on the ledger's full path, a test-environment
+artifact confirmed by reproducing cleanly at a shorter path, not a code bug): `New-StgProject -Mode
+tracking` auto-creates `<root>\.claude\stories\stories.json`; `switch-story.ps1 new`/`story-ledger.ps1 init`
+both succeed and produce a correctly-shaped node/ledger; `story-doc.ps1`'s all four actions (`path`/`show`/
+`append`/`init`) round-trip correctly, including a real append landing under `## Work log` at EOF;
+`host.ps1`'s `storydoc`/`apps`/`projects`/`allstories` actions all verified through the actual framed
+native-messaging protocol (not just direct PowerShell calls); `remove-worktree.ps1`'s `-CheckAll` returns
+`na:true` and its real removal archives the full node+ledger into `stories_history.json`, drops the registry
+node, and deletes the `.md` doc; `story-doctor.ps1` verified clean both before and after a real removal
+(confirming the history-loop fix doesn't just suppress the phantom finding but still correctly leaves a
+*legitimate* thin-history check possible for a record that genuinely lacks a node/ledger); the full
+`addProject` flow (mode selector → `background.js` → `host.ps1` → `New-StgProject -Mode tracking`) verified
+through the real host action end to end, not just the underlying PowerShell function. **Not yet verified**:
+the popup/Settings UI in an actual browser (native-messaging host registration is a system-modifying step
+not taken without asking first — the same standing limitation as every other phase since P4b).
+
+---
+
+## 🧭 main_workspace / dev_workspace + planning discipline
+
+A no-story, project-wide workspace for planning/brainstorming, plus (tracking mode only) a real gate
+before implementation starts — the fix for a concrete problem: a Claude Code session left to just start
+coding from a request, with no settled direction, produces messy, undirected changes. Both modes get
+`main_workspace`; only tracking mode gets the rest, since worktree-mode tickets already arrive pre-planned
+(e.g. from Jira) and don't need a brainstorm-first gate.
+
+- **Worktree mode**: `main_workspace.code-workspace` (`<workspace dir>\main_workspace.code-workspace`) is
+  every home-base app clone, no story attached — regenerated **fresh on every open** (`switch-story.ps1`'s
+  `Write-MainWorkspace`/`Open-MainWorkspace`/`Invoke-OpenMain`, scanning `<Root>\*` for `.git` directories
+  the same way `host.ps1`'s `apps` action does, absolute paths — the workspace/root split means a relative
+  path can't be assumed), so it always reflects whichever apps are actually cloned right now. Never touches
+  any app's git branch or working tree — app list only, no checkout behavior. Reached via the popup's
+  project-wide **🧭 Open main workspace** button (next to ↗ Open all — `openMainWorkspace` message →
+  `openmain` host action → `switch-story.ps1 openmain -Json`) or the `story-tab-groups` skill's own
+  "Workspaces" section. `story-doctor.ps1`'s stale-workspace scan allow-lists `main_workspace`/
+  `dev_workspace`/the legacy `full_ui_workspace` name, so none of these ever get flagged as an orphaned
+  `.code-workspace` with no registry node.
+- **Tracking mode**: `main_workspace.code-workspace` and `dev_workspace.code-workspace` both sit directly
+  at `<root>\` (the repo root itself, next to `.gitignore`) — **not** via `$Paths.WorkspaceDir` (that's
+  `$null` for tracking mode by design; repurposing it would mean touching `Resolve-StgPaths`' own
+  tracking-mode null-means-"no workspace concept" contract) — but they are **not** the same folder list.
+  `main_workspace` is a relative `"."` folder entry (the whole project root, so the file stays portable
+  if committed) — planning needs `DESIGN.md`/`ROADMAP.md`, which live at the root, so the whole folder is
+  the point. `dev_workspace` lists **only the actual git repos** found under the root (one `.git`-directory
+  child folder per entry, plus anything under `<root>\repositories\` — `Get-StgTrackingRepos`,
+  `stg-paths.psm1`), so `DESIGN.md`/`ROADMAP.md`/`stories.json`/`.claude\` never show up in the window
+  you actually write code from. **Found worth splitting after the fact**: a real tracking-mode project
+  (`WorkoutTrackerProject`, a container of `workout-tracker-service`/`workout-tracker-ui` clones, not a
+  git repo itself) made the original "both point at the same single repo" design visibly wrong —
+  `dev_workspace`'s old `"."` entry opened the whole container, generated files and all, not the two repos
+  you'd actually edit. The window *title* ("Planning - ..." vs "Dev - ...") is still the only signal for
+  which one a session is in — there's no way to introspect which literal file launched it — so **the real
+  gate a session follows is ledger state** (the `plan` phase — see below), never which workspace is open.
+  `main_workspace` is still written **once**, at project-add time (`New-StgTrackingScaffold`, called from
+  `New-StgProject`) and never touched again — tracking mode's root itself never changes, so there's
+  nothing about *that* file that can go stale. `dev_workspace` is the opposite: `New-StgTrackingScaffold`
+  only writes it once too (and skips it if the project has no repos cloned yet, rather than failing
+  project-add over it), but it's also **regenerated fresh every time it's opened** via the popup's
+  **🛠 Dev workspace** button (next to 🧭 Open main workspace — `openDevWorkspace` message → `opendev` host
+  action → `switch-story.ps1 opendev -Json` → `Invoke-OpenDev`/`Write-StgDevWorkspace`), the same
+  "always reflects what's actually cloned right now" reasoning worktree mode's own `main_workspace`
+  already follows — a newly-cloned repo shows up the very next open with nothing to click. `Invoke-OpenDev`
+  refuses cleanly (`ok:false`) for a worktree-mode project; the popup hides the button there entirely.
+- **Planning discipline (tracking mode only)**: the `story-tab-groups` skill's "Planning discipline"
+  section (mode-gated — see [Agent skill](#agent-skill-claude-code--codex--chatgpt) below) teaches: don't
+  mark the ledger's `plan` phase done, and don't start `implement`, until a real design conversation
+  actually happened. Brainstorm a topic first, tracked in `<root>\DESIGN.md` under three headings —
+  `## LOCKED` (settled; don't silently contradict later), `## OPEN` (still being decided), `## REJECTED`
+  (ruled out, with a one-line reason so it doesn't get re-litigated) — adapted from KibaWolfSpirit's real,
+  working `/brainstorm` → design-doc → `wave-planner` → `plan.md` → `ROADMAP.md` chain (used as a reference,
+  confirmed by reading it directly). Only once a topic is LOCKED does it become a story, seeded via one
+  `switch-story.ps1 note` call into the *same* per-story `.md` doc `story-doc.ps1` already writes work-log
+  entries into (Context / Locked decisions / an Acceptance-criteria table, every row starting unmet /
+  Out of scope) — **one artifact per story**, not Kiba's separate `plan.md`/`development.md`/`testing.md`
+  split. Sequencing lives in `<root>\ROADMAP.md`, one row per story.
+- **The hybrid commit model**: `stories.json` / `DESIGN.md` / `ROADMAP.md` / each story's own `.md` doc are
+  the durable planning record and are meant to be **committed** — matching Kiba's own "commit the plan
+  alongside the code" discipline. Only two kinds of ephemera get excluded via a `.gitignore` entry
+  `New-StgTrackingScaffold` adds **additively** (append-if-missing, never touching anything else already in
+  the file) the moment a tracking project is added: the live per-story ledger
+  (`<docsDir>\*.story-ship-state.json`) and `StoryLib.psm1`'s `Enter-RegistryLock` lock file
+  (`<docsDir>\*.lock`, a 0-byte OS-lock handle opened next to the registry and never deleted — found live
+  while verifying this very feature: it showed up as an untracked, non-ignored file after the very first
+  story creation, exactly the "not clean when committing" mess this whole feature exists to avoid).
+  Verified end to end: `git status --ignored` on a real fixture shows both as `!!` while `stories.json`/
+  `.gitignore`/`DESIGN.md`/`ROADMAP.md`/both workspace files/the story's own `.md` all stage normally: a
+  pre-existing `.gitignore`'s own unrelated lines (confirmed with `node_modules/`/`dist/`/`*.log`) survive
+  untouched.
+- **`New-StgTrackingScaffold`** (`stg-paths.psm1`) is the **one implementation** behind all of this —
+  `stories.json`, the `.gitignore` entries, `DESIGN.md`/`ROADMAP.md`, both workspace files, and (purely
+  cosmetic, no functional wiring) empty `worktree\`/`workspace\` placeholder folders matching worktree
+  mode's own root layout — each guarded by its own already-present check, returning what it created vs.
+  what it found. `New-StgProject` calls it
+  unconditionally for a brand-new tracking project; **`tools\setup-dev-loop.ps1`** (`check`/`apply`, refuses
+  outright on a worktree-mode project) calls the exact same function to **retrofit** a tracking project that
+  was added *before* this feature existed — one implementation, not two copies to keep in sync. `check` is
+  read-only (a hand-rolled presence check, calling nothing that writes); `apply` is the only action that
+  writes, meant to run only after a human has seen `check`'s `missing` list and said yes, matching
+  dev-cycle's own bootstrap rule (propose, one confirmation, then write). The companion
+  **`skills/setup-dev-loop/SKILL.md`** teaches an agent exactly that check-then-confirm-then-apply sequence;
+  installed the same way as the main skill (`install-agent-skill.ps1 install -Project <id> -Scope
+  user|project -Skill setup-dev-loop`).
+
+---
+
+## Agent skill (Claude Code / Codex / ChatGPT)
+
+Settings' **Agent integration** card teaches an AI coding agent to drive a tracking-mode project's story
+registry directly from the CLI — list stories, create one, append a work-log entry, advance a ledger
+phase, mark released — instead of a human handing it each command by hand. One skill source,
+[`skills\story-tab-groups\SKILL.md`](skills/story-tab-groups/SKILL.md), a template with
+`{{PROJECT_ID}}`/`{{PROJECT_ROOT}}`/`{{TOOLS_DIR}}` placeholders.
+
+- **`tools\install-agent-skill.ps1`** renders (`-Action render`) or installs (`-Action install -Scope
+  user|project`) a template for ONE resolved project — `-Project` is **mandatory** here, unlike every
+  other script in `tools\` (which falls back to whichever project is currently active): a skill silently
+  bound to "whichever project happens to be active right now" would be actively wrong the moment a second
+  project exists or the active one later changes. `-Skill` picks which template — `story-tab-groups`
+  (default, the day-to-day skill) or `setup-dev-loop` (the one-time bootstrap skill, see [main_workspace /
+  dev_workspace](#-main_workspace--dev_workspace--planning-discipline)) — from a `[ValidateSet]`, never an
+  arbitrary caller-supplied path. **One rendering path, reused by every consumer** — the Claude-installed
+  file, the Codex "Copy AGENTS.md snippet" button and the ChatGPT "Copy instructions" button all call the
+  same action, so none of the three can drift out of sync with each other the way three
+  independently-maintained copies would. `render` writes nothing at all; only `install` does. `-Scope user`
+  writes to `%USERPROFILE%\.claude\skills\<skill>\SKILL.md` (every project), `-Scope project` to
+  `<project root>\.claude\skills\<skill>\SKILL.md` (this project only) — the **script** decides the
+  destination from `-Scope`/`-Skill`, never a path the caller supplies, matching `setappmap`'s and
+  `storydoc`'s existing security posture (see [Standalone / portability](#standalone--portability) and
+  [🗑 Worktree removal](#-worktree-removal-the-native-host-bridge) below for those precedents).
+- **Mode-aware rendering** (`story-tab-groups` template only): the template carries both modes' content,
+  delimited by `<!-- MODE:tracking -->...<!-- /MODE:tracking -->` / `<!-- MODE:worktree -->...
+  <!-- /MODE:worktree -->` blocks (inline mid-bullet or whole paragraphs — the stripping regex doesn't
+  care which). The script drops the *other* mode's blocks entirely, then strips the current mode's own
+  markers so only its content remains, unwrapped — a no-op for `setup-dev-loop`'s template, which has no
+  markers at all. **Fixes a real, previously-shipped bug**: before this existed, every installed skill
+  unconditionally said "this project tracks stories, it doesn't cut git worktrees," even when rendered for
+  a worktree-mode project (confirmed live against the real, already-installed `workouttrackerapp` skill —
+  re-installing it after this fix now correctly reads "cuts a real git worktree per app").
+- **`native-host\host.ps1`'s `installskill` action**: `$msg.scope` validated against an allow-list
+  (`user`/`project`) before being forwarded, `$msg.install` picks `render`/`install`. Root-independent (no
+  `Test-RootReady`) — rendering needs a *resolved project* to bake into the template, not a live
+  "does this root's data currently check out" gate. Always resolves to the **active** project (no
+  `-Project`/`id` override reachable from the UI — this card, like Paths & diagnostics, has no
+  "editing a non-active project" concept).
+- **Every command the skill teaches bakes in `-Project {{PROJECT_ID}}` explicitly** — confirmed necessary
+  by reading `Resolve-StgPaths`: with no `-Project`, these scripts fall back to whichever project is
+  currently active in the *popup*, which the skill must never silently ride along with.
+  `switch-story.ps1 note <KEY> "text" -Project <id>` is the taught "append a work-log entry" command, not
+  a raw `story-doc.ps1 append` call — `story-doc.ps1 append` only accepts `-TextB64` (base64), and `note`
+  already does that encoding internally for a tracking-mode story, so the skill never has to teach Claude
+  an encoding step it could get wrong.
+- **dev-cycle sync is instruction-level, not a technical hook** — confirmed by reading
+  `~\.claude\skills\dev-cycle\`'s actual `SKILL.md`/`references\bindings.md` directly: dev-cycle has no
+  extension point for another skill to observe its phase transitions. Its only phase-transition signal is
+  its own standing rule to rewrite `.claude\state\cycle.md` at each transition — a file that's gitignored
+  under `state_mode: local` and current only because dev-cycle's *own* instructions say to, not anything
+  code-enforced. So the skill's own text carries a best-effort mapping table (dev-cycle's 0–8 phases →
+  the ledger's 8 phases — they don't line up 1:1, and the skill says so) and an instruction: *if this repo
+  also has `.claude\dev-cycle.json`, mirror a dev-cycle phase transition into the mapped
+  `story-ledger.ps1 done <phase>` call too, best-effort, skip if the mapping doesn't clearly apply*.
+  dev-cycle's own state stays authoritative regardless — this is honestly consistent with how dev-cycle
+  enforces its *own* rules (by an agent following written instructions), not a step down from some
+  sturdier mechanism that doesn't exist to step down from.
+- **Harness detection, not creation.** `devCycleDetected` is a pure `Test-Path <project root>\.claude\
+  dev-cycle.json` check, matching dev-cycle's own bootstrap check exactly — real bound `dev-cycle.json`
+  files extend the schema with extra, undocumented per-repo keys (confirmed against two real examples on
+  the machine this was built on), so JSON-shape validation would be actively wrong; existence is the only
+  thing that means anything. The card surfaces *"dev-cycle harness: found / not found"* read-only, never
+  writes one — dev-cycle's own bootstrap needs one human confirmation of the proposed JSON before writing
+  anything, and an unattended write here risks clobbering hand-maintained sequencing notes with no git
+  safety net under `state_mode: local` (`.claude\state\` is gitignored in every real bound repo checked).
 
 ---
 
@@ -107,7 +468,8 @@ from it) and resolves `<root>` itself via `tools\stg-paths.psm1`'s `Resolve-StgP
   shows the unpushed commit afterward. ♻ (below) is unaffected and stays the safe, non-typed
   fast path for the *purely-generated-files* case — CONFIRM is specifically for when there's real
   work or unpushed commits in the way, which ♻ was never able to touch anyway.
-- `native-host/` files: `host.ps1` (framed stdin/stdout JSON; actions: `ping` / `remove` / `check` / `history` / `stories` / `ledgers` / `envstatus` / `release` / `released` / `doctor` / `add` / `addcheck` / `addapps` / `addappscheck` / `apps` / `setappmap` / `openworkspace` / `getConfig` / `setConfig` / `preflight`; every script action resolves from `tools\` via one `$ScriptsDir`, so `remove`/`check` can no longer silently run a *different* copy than every other action — the old asymmetry that caused the "returned no JSON" debugging trap), `host.bat` (launcher),
+- `native-host/` files: `host.ps1` (framed stdin/stdout JSON; actions: `ping` / `remove` / `check` / `history` / `stories` / `ledgers` / `envstatus` / `release` / `released` / `doctor` / `add` / `addcheck` / `addapps` / `addappscheck` / `apps` / `setappmap` / `openworkspace` / `openmain` / `opendev` / `getConfig` / `setConfig` / `preflight` / `projects` / `allstories` / `addProject` / `getProjectConfig` / `setProjectConfig` / `removeProject` / `storydoc` / `installskill` — the six `*Project`/`projects`/`allstories` actions are the multi-project CRUD/listing surface, see
+  [Projects (multi-project support)](#projects-multi-project-support); `storydoc` is tracking mode's per-story doc bridge, see [Tracking mode](#tracking-mode); `installskill` renders/installs the agent skill, see [Agent skill](#agent-skill-claude-code--codex--chatgpt); every script action resolves from `tools\` via one `$ScriptsDir`, so `remove`/`check` can no longer silently run a *different* copy than every other action — the old asymmetry that caused the "returned no JSON" debugging trap), `host.bat` (launcher),
   `install-native-host.ps1` (writes `com.storytabgroups.worktree.json` + the
   `HKCU\Software\<vendor>\NativeMessagingHosts\com.storytabgroups.worktree` reg key; auto-detects
   the extension id from Chrome/Edge/Brave profiles **by matching each profile's recorded extension
@@ -164,12 +526,15 @@ popup ✓ confirm  ──sendMessage('addWorktree')──▶  background.js
         ──▶  host.ps1  ──▶  ..\tools\switch-story.ps1 new <KEY> <env> <apps> -Root <root> -Title <t> -JiraUrl <u>
              -Branch <b> -NoInstall [-Open] -Json
              (registers the stories.json node FIRST, then per app: git fetch origin → git worktree
-              add -b <branch> ... origin/main, or check out <branch> if it already exists → seed
-              .env from home base → init the ledger → optionally write + open the .code-workspace)
+              add --no-track -b <branch> ... origin/<app's own detected default branch>, or check
+              out <branch> if it already exists → seed .env from home base → init the ledger →
+              optionally write + open the .code-workspace)
 ```
 
-- **Repo discovery** is the `apps` action: it scans `<GRoot>\*` for a **`.git` directory** (a home
-  base clone) vs a **`.git` file** (a worktree) vs **neither** (a story folder) — the *configured*
+- **Repo discovery** is the `apps` action: it scans `<ReposRoot>\*` (`<root>\repositories\` for a
+  new-enough project, else `<GRoot>\*` itself via `Resolve-StgPaths`' fallback — see **Worktree
+  paths & branch format** below) for a **`.git` directory** (a home base clone) vs a **`.git` file**
+  (a worktree) vs **neither** (a story folder) — the *configured*
   app map (see **Settings: Apps** below) is not the ground truth for what's actually cloned, it's
   cross-referenced against the scan. Returns `{app, repo, origin, onDisk, mapped, used, def,
   hidden}` per app (`def` is the app map's port/start/health entry, `$null` when unmapped); an
@@ -274,19 +639,60 @@ portability](#standalone--portability) for the full precedence order):
   except when the extension's id changes (see the id-drift gotcha below) — the two moves are
   independent.
 - **Worktree root** — genuinely different from Root: only *per-story* worktree folders
-  (`<worktreeRoot>\<STORY>\<app>`) move; home-base clones (`<Root>\<app>`, the ones you `git fetch`
-  from) always stay under Root. This is the "my worktrees are bloating my main drive" case.
-- **Workspace dir** — where `.code-workspace` files are written. Defaults to
-  `<parent of Root>\<Root's folder name>_WorkSpaces` (so a root named `Ganesha` still gets
-  `Ganesha_WorkSpaces`, unchanged from before this was configurable) — override it directly if you
-  want it somewhere else entirely.
+  (`<worktreeRoot>\<STORY>\<app>`) move; home-base clones (see **Repos root** below) don't move with
+  it. This is the "my worktrees are bloating my main drive" case.
+- **Workspace dir** — where `.code-workspace` files are written.
+- **Repos root** — where home-base app clones (`git fetch`/`git worktree add`'s source) actually
+  live. Genuinely different from both Root and Worktree root: this is *where you `git clone` your
+  apps*, not where per-story copies of them go.
+- **A brand-new worktree-mode project's default**: `New-StgProject` now bakes `worktreeRoot`/
+  `workspaceRoot`/`reposRoot` explicitly into the new project's own record, pointing at
+  `<root>\worktree\`, `<root>\workspace\` and `<root>\repositories\` respectively (all three created
+  on disk immediately, alongside `stories.json`/`app-map.json`) — a tidier shape than the tool's own
+  OLD fallback defaults (worktrees landing flatly at `<Root>\<STORY>\<app>`, workspace files in an
+  *external sibling* folder `<parent of Root>\<Root's folder name>_WorkSpaces`, app clones flatly
+  mixed into Root itself), found worth making the default after noticing a real project's
+  *manually*-configured worktree/workspace paths already used exactly this `<root>\worktree` /
+  `<root>\workspace` shape (`reposRoot`/`<root>\repositories\` extends the same idea to app clones,
+  a distinct follow-on ask, verified against **13 call sites across 5 files** that all assumed a
+  clone lived at `<Root>\<app>` directly, none through a shared helper — `Get-HomeBaseApps` and
+  `Write-MainWorkspace` in `switch-story.ps1`, `New-WorktreeExisting`/`New-WorktreeFromMain`,
+  `Invoke-New`/`Invoke-Add`/`Invoke-Remove`'s per-app `$baseDir`, `remove-worktree.ps1`'s removal
+  loop, `story-handover.ps1`'s worktree-move step, and `host.ps1`'s `apps` scan — each redirected to
+  read `$ReposRoot`/`$PathsInfo.ReposRoot` instead). **This only ever affects a project added from
+  this point on** — an existing project with no `worktreeRoot`/`workspaceRoot`/`reposRoot` field of
+  its own still resolves through the unchanged old fallback (`Resolve-StgPaths`'s own defaulting
+  logic was deliberately left untouched, specifically so this couldn't silently move where an
+  existing project's future worktrees/workspace files/app clones are looked for — confirmed live
+  against PortfolioApp's real resolved paths). Blank fields in Settings still show the OLD defaults
+  as their placeholder text — that's the fallback's own default, not this feature's. Clearing a
+  field in Settings reverts to that same fallback (`Root` itself for Repos root), **not** to
+  whatever the auto-created folder happened to contain — confirmed live: clearing `reposRoot` after
+  a real clone existed under `<root>\repositories\` made resolution fall back to `Root`, not
+  silently remember the folder.
+- **Tracking mode gets `worktree\`/`workspace\` too, empty** (`New-StgTrackingScaffold`) — cosmetic
+  structural consistency only (a tracking-mode root doesn't look different from a worktree-mode
+  one for no reason a person browsing it would understand); `Resolve-StgPaths` still returns
+  `WorktreeRoot`/`WorkspaceDir` as `$null` for tracking mode, unchanged, and nothing reads or
+  writes into these two folders there. **Repos root deliberately does NOT get a tracking-mode
+  placeholder** — unlike `worktree\`/`workspace\`, "repositories" specifically means clones
+  alongside a *container* root, which a tracking project's root (already the one tracked repo) has
+  no analog for; `ReposRoot` is `$null` there too, but no folder is ever created.
+- **Kept out of the home-base app-clone scan**: `Get-HomeBaseApps` (`switch-story.ps1`) and
+  `host.ps1`'s `apps` action both skip-list the worktree-root and repos-root folders' own names now,
+  alongside the workspace-dir entry already skip-listed there — belt-and-suspenders, since a
+  dedicated `worktree\`/`repositories\` container has no `.git` *directory* directly inside it
+  anyway (nested worktrees sit two levels down, and a worktree's own `.git` is a *file*, not a
+  directory), so the existing `.git`-directory check already excluded it naturally even before this
+  was added. The scan itself now targets `$ReposRoot`, not `$Root` directly — for an existing
+  project (`ReposRoot` falling back to `Root`) this is byte-for-byte the same scan as before.
 - **Organization settings** (Jira base URL, GitHub org, EOD task name prefix, owner, repo
   aliases) — every literal that used to be a hardcoded org-specific string (`vesta.atlassian.net`,
   `vesta-experimental`, `Ganesha EOD status reminder`, the `iu`→`ui` repo alias, `Vince Marfil`) is
   now one of these fields, defaulting to exactly that original value.
 
 **Storage**: `%LOCALAPPDATA%\story-tab-groups\stg-config.json` (`{ root, worktreeRoot,
-workspaceRoot, branchFormat, jiraBaseUrl, githubOrg, repoAliases, taskNamePrefix, owner,
+workspaceRoot, reposRoot, branchFormat, jiraBaseUrl, githubOrg, repoAliases, taskNamePrefix, owner,
 hiddenApps }`, all optional), written by `tools\stg-paths.psm1`'s `Set-StgConfig` (called from both
 the host's `setConfig` action and every `tools\*.ps1` script directly) and read by `Get-StgConfig` /
 the host's `getConfig` action — **outside** the extension folder on purpose, so replacing or
@@ -318,13 +724,28 @@ ports/health button unreliable on a fresh install:
   from the scan (`native-host/host.ps1`'s `$skip` list is a different, structural thing: folders
   that are never candidate apps at all, like this extension's own folder or `tools\`). Persisted as
   `hiddenApps` in `stg-config.json`.
-- **Storage**: always the **`%LOCALAPPDATA%\story-tab-groups\app-map.json`** copy — never the
-  shipped `tools\app-map.json` — mirroring why `stg-config.json` itself lives outside the extension
-  folder. `tools\stg-paths.psm1`'s `Get-StgAppMapPath` resolves the `%LOCALAPPDATA%` copy first and
-  falls back to the `tools\` template only when no user copy exists yet, so an untouched install
-  behaves exactly as before this existed. The first Settings save seeds forward whatever
-  `pythonSentinel` the currently-effective file has, so it isn't silently reset to `story-env.ps1`'s
-  own `'fastapi'` default.
+- **Storage lives in the project's own folder, next to its `stories.json`.** `setappmap` writes to
+  **`<project root>\app-map.json`** — never the shipped `tools\app-map.json` template. A project is
+  meant to be self-contained: everything about it (`stories.json`, `stories_history.json`,
+  `app-map.json`) sits in one folder you can find or back up as a unit, rather than split between
+  its own root and the extension's own `%LOCALAPPDATA%`. `New-StgProject` creates an empty
+  `app-map.json` there (alongside an empty `stories.json`) the moment a project is added — see
+  [Projects](#projects-multi-project-support) for why this auto-create exists at all (a real,
+  previously-undiscovered gap: a project with no `stories.json` couldn't create its first story).
+  **This moved here from an earlier, `%LOCALAPPDATA%`-centric design** — `Get-StgAppMapPath -Project
+  <id>` still checks the *old* `%LOCALAPPDATA%\story-tab-groups\projects\<id>\app-map.json` location
+  as a read-only fallback for any project with real data still sitting there from before the move
+  (never written to again; the next Settings save "completes" that project's migration on its own,
+  no separate step needed), then the shared `%LOCALAPPDATA%\story-tab-groups\app-map.json` singleton
+  **only while at most one project is configured total**, then the shipped template. **Both moves
+  were found by live-testing, not design review**: first, an unconditional shared-singleton fallback
+  let a brand-new second project silently inherit the first project's entire app list as "not
+  cloned" placeholders (fixed by the "≤1 project" gate); then, once that was fixed, the user pointed
+  out the surviving per-project `%LOCALAPPDATA%` rung itself was still the wrong place for project
+  data to live at all — moving it into the project's own folder is what actually resolved that.
+  The first Settings save on any given project still seeds forward whatever `pythonSentinel` that
+  project's currently-effective file has, so it isn't silently reset to `story-env.ps1`'s own
+  `'fastapi'` default.
 - **Validation happens before, not during, the write.** A non-numeric port or a name containing a
   path separator gets a clean `ok:false` from `setappmap`, both client-side (immediate feedback) and
   host-side (`[int]::TryParse`, not a bare `[int]` cast — a bad string on the bare cast throws under
@@ -343,6 +764,14 @@ the `$storyDir` parent-folder cleanup) but **doesn't touch `Get-StoryFolders` it
 in `tools\StoryLib.psm1` and is shared by every script that needs worktree-aware folder discovery,
 so it patches just the per-app paths `Get-StoryFolders` returned, after the fact, whenever
 `$node.worktreeRoot` is set, rather than forking the function.
+
+**Repos root deliberately gets NO equivalent per-story pinning.** A home-base clone's location is a
+*project*-level fact (where you `git clone`d it), not a per-story one the way a worktree's location
+is — every story that touches the same app always resolves the SAME clone, so there's nothing to
+strand: `$ReposRoot` is read fresh from the CURRENT project config on every git operation, with no
+node field recording where it "used to be." Confirmed by tracing all 13 call sites before building
+this (see **Worktree paths & branch format** above) — none of them read a per-story override for
+this, unlike every `worktreeRoot`/`Get-WtPath` call site.
 
 **Branch format**: `-BranchFormat` templates the *derived* default (`feature/{env}/{key}` built in;
 only `{env}`/`{key}` are recognized, substituted with plain `.Replace()` — not regex `-replace`, so
@@ -391,9 +820,14 @@ showed a stale phase, and nothing could tell `/eod` to emit its "done" line.
   `stories_history.json` on removal because the whole node is archived.
 - **Write side** is `..	ools\story-release.ps1` (`release` / `unrelease` / `status -All`), so the
   CLI and the button share one implementation. `release` first runs `story-ledger.ps1 sync`, which
-  backfills the prep-release phases from node fields that already prove they happened (`rel`,
-  `releaseBranch`, `chg_number`, `agiletest_urls`) - that is what stops a shipped story showing a
-  half-empty checklist forever. Both directions are **idempotent**.
+  backfills the `plan` phase from a node field that already proves it happened (`document` /
+  `document_keycloak_setup`) - that is what stops a shipped story showing a stale pending checklist
+  item forever. (The ledger's phase list used to include six org-specific prep-release gates -
+  release-notes/rel-ticket/agiletest/release-branch/release-prs/chg - each backfilled from its own
+  node field the same way; they were dropped when the org's deployment process changed, leaving
+  `deploy` as the sole phase in its own **Release** group, renamed from "Prep Release". See
+  `tools/story-ledger.ps1`'s `$DefaultPhases` for the current list.) Both directions are
+  **idempotent**.
 - **Toggle, not a one-way door.** Clicking 🚀 on a released story rolls it back (revert / rollback),
   resetting `deploy` to pending and clearing `released`. It also clears `released_posted`, so a
   later re-release announces "done" again in the EOD post.
@@ -456,10 +890,16 @@ it works — no hand-editing, no second folder full of scripts, no other machine
   invalidation. `$env:STG_ROOT` keeps its purpose (a bare terminal/skill invocation with no config
   file yet) by still beating blind auto-detect. The module also exposes
   `Get-StgConfig`/`Set-StgConfig` (the config file), `Get-StgOrgDefaults`/`Get-StgOwnerConfigDir`
-  (the de-hardcoded org literals below), `Get-StgAppMapPath` (the app map — `%LOCALAPPDATA%` copy
-  first, `tools\app-map.json` fallback; see [Settings: Apps](#settings-apps)), and `Get-StgNames`
-  (a JSON object's property names as a real array, never the `@($null)` one-element-array-of-null
-  trap — see the dev gotcha below).
+  (the de-hardcoded org literals below), `Get-StgAppMapPath [-Project]` (a four-rung ladder:
+  `<project root>\app-map.json` (canonical, auto-created by `New-StgProject`) → the *old*
+  per-project `%LOCALAPPDATA%\...\projects\<id>\app-map.json` rung (read-only fallback for a
+  project with real data still there from before app-map.json moved into the project's own folder)
+  → the shared `%LOCALAPPDATA%` singleton (only while ≤1 project exists) → the `tools\app-map.json`
+  template; see [Settings: Apps](#settings-apps) and [Projects](#projects-multi-project-support) —
+  `native-host\host.ps1`'s `setappmap` action always writes to the project-root rung once a project
+  context resolves, so two projects' app maps never collide, and a project on the old rung
+  self-migrates the moment its Apps card is next saved), and `Get-StgNames` (a JSON object's property names
+  as a real array, never the `@($null)` one-element-array-of-null trap — see the dev gotcha below).
 - **Every org-specific literal is config, defaulting to this project's original values**: the
   `Ganesha_WorkSpaces` folder name (now derived: `<rootLeaf>_WorkSpaces`, overridable via
   `workspaceRoot`), `%USERPROFILE%\.ganesha` (now `.story-tab-groups`, falling back to the legacy
@@ -502,6 +942,25 @@ it works — no hand-editing, no second folder full of scripts, no other machine
 - **No `confirm()` / `alert()` in the popup.** Opening a native dialog blurs the popup, which Chrome
   auto-closes → the call returns/!does nothing. That's why removal uses an **inline** confirm + the
   `#rmMsg` status line. Keep it that way.
+- **A saved rules override can silently outlive every real change you make.** `rulesOverrides[projectId]`
+  (Settings' Advanced paste/picker box) is checked *first* in `buildProjectRules()`, by original,
+  deliberate design — a "trust my curation" escape hatch that's meant to beat live data. The trap:
+  `forceRulesRebuild()` (called after every story mutation) only ever cleared the *auto-built* cache, a
+  completely different `chrome.storage.local` key from `rulesOverrides` — so once an override existed for
+  a project, it stayed authoritative **forever**, through any number of real, host-confirmed story
+  creations/removals, until someone found "Clear override" in Settings. **Confirmed live**, the hard way:
+  two story creations in a row, both fully successful (real worktrees, real log entries, confirmed via
+  direct native-host queries), neither ever appeared in the popup — because an override had been pinned
+  earlier via the popup's own "Load stories.json" button (`RB.syncSilently()`), and nothing had ever
+  cleared it. **That popup button is gone now** — the identical capability still exists in Settings'
+  Advanced section, deliberately framed as a native-host-unreachable fallback rather than an ambient
+  one-click control anyone could trip on the primary surface. **Fix, and the standing rule**:
+  `background.js`'s `clearProjectOverride(projectId)` runs alongside `forceRulesRebuild()` at every case
+  that mutates a story node for a specific project (`addWorktree`/`addApps`/`removeWorktree`/
+  `setReleased`/`setStoryLinks`) — any future case that writes to a project's `stories.json` needs the
+  same pairing, or it'll reopen this exact trap. The one legitimate remaining case (a deliberate override
+  that hasn't been superseded by a real change yet) is surfaced via the popup's `#overrideNote`, not left
+  silent.
 - **`[hidden]` silently loses to a same-specificity `display` rule.** The browser's own
   `[hidden] { display: none }` is an attribute selector; a class selector like `.addform { display:
   flex }` has *identical* specificity, and on a tie the later stylesheet wins — which is always the
@@ -532,7 +991,72 @@ it works — no hand-editing, no second folder full of scripts, no other machine
   single property, N on N, without reintroducing the scalar-collapse bug `@()` was there to prevent
   in the first place. Bare foreach-over-properties reads (no hashtable/array index in the body) are
   unaffected — `Join-Path $x $null` and property access on `$null` both degrade harmlessly, so only
-  sites that *index* with the loop variable need the fix.
+  sites that *index* with the loop variable need the fix. **Recurred independently in
+  `story-doctor.ps1`'s `thin-history-record` check** (`foreach ($e in @($hist.removed))`, missing the
+  `if (-not $e) { continue }` guard its own sibling `log-shape` loop two blocks up already has) — a
+  phantom `info` finding with an empty story key on every project before its first-ever removal, found
+  while verifying [Tracking mode](#tracking-mode) but pre-existing and affecting worktree-mode projects
+  too. Same idiom, same fix, different call site — worth grepping for `@($` + a property access +
+  no adjacent null-guard if this class of bug ever needs auditing again. **Recurred a third and fourth
+  time in the same file** during the P6 bug sweep — `$regKeys`/`$mapApps` in `story-doctor.ps1`'s own
+  setup block, both still the bare `@($obj.PSObject.Properties.Name)` idiom rather than `Get-StgNames`.
+  `$regKeys` was the more consequential of the two: on a genuinely empty registry it produced a
+  phantom `bad-key-shape` error (plus, in worktree mode, phantom `no-apps`/`no-jira` findings) —
+  confirmed live via a fresh worktree-mode project with zero stories, `ok:true, findings:[]` after the
+  fix vs. spurious errors before it. At this point the pattern is: **any new `@($x.PSObject.Properties
+  .Name)` written in this codebase is very likely a bug on day one**, not something that degrades later
+  — reach for `Get-StgNames` by default rather than the bare idiom, full stop.
+- **`Write-Output -NoEnumerate` suppresses pipeline unrolling for *any* consumer, not just plain
+  assignment — a different, easy-to-reintroduce PowerShell collapse trap from the one above.**
+  `Get-StgProjects` (`stg-paths.psm1`) uses `-NoEnumerate` so a *one*-project result survives
+  crossing its own `return` boundary as a real array instead of collapsing to a bare object
+  (PowerShell unrolls any enumerable that crosses a function's return boundary, regardless of
+  `@()`-wrapping *inside* the function — unrelated to `ConvertTo-Json`'s separate JSON-serialization
+  collapse trap above). The sharp edge: piping the function call directly
+  (`Get-StgProjects | Where-Object {...}`) or wrapping the *call* in `@()`
+  (`@(Get-StgProjects)`) both silently fuse every project into one corrupted blob the moment a
+  *second* project exists — `-eq`/`-ieq` against an array left-hand side degrades to a filter, not a
+  scalar comparison, so a match against *either* project lets **both** through fused together (e.g.
+  `Get-StgProject -Id 'acme'` returning a value whose `.id` prints as `"ganesha acme"`). This hit at
+  least five separate call sites while building multi-project support — `Get-StgProject`'s own
+  defensive `@(Get-StgProjects)`, `Resolve-StgPaths`'s `-Root` reverse lookup, and all three of
+  `New-StgProject`/`Update-StgProject`/`Remove-StgProject` — each one looked like careful,
+  even extra-careful code, and each was wrong, invisible in single-project testing every time.
+  **Fix, and the standing rule for any future caller: capture into a plain variable first
+  (`$x = Get-StgProjects`), then operate on that variable — never pipe or `@()`-wrap the live
+  function call.** A captured variable enumerates normally regardless of how it was produced; only a
+  function's *live* pipeline output is subject to `-NoEnumerate`.
+- **A `Get-Content -Raw` result passed directly into `ConvertTo-Json` isn't the plain string it looks
+  like.** Its declared .NET type is `System.String` (`.GetType().FullName` says so), but the PSObject
+  wrapper still carries PowerShell's extended type-system members (`PSPath`/`PSParentPath`/
+  `PSChildName`/`PSDrive`/`PSProvider`/`ReadCount`) that the provider infrastructure attaches to
+  *every* `Get-Content` result. `ConvertTo-Json` walks `PSObject.Properties`, not the declared CLR
+  type, so it sees an object with those properties and recurses into them at whatever `-Depth` was
+  given — including `PSDrive`/`PSProvider`'s own large, framework-internal object graphs. Not an
+  infinite loop, but slow enough to be indistinguishable from a hang in practice: confirmed by
+  isolated testing, an identical hashtable serialized instantly with `[System.IO.File]::ReadAllText`'s
+  plain string but never returned within 30s with `Get-Content -Raw`'s decorated one. This is exactly
+  what `story-doc.ps1`'s `show` action hit on its very first live test (see
+  [Tracking mode](#tracking-mode) for the full story). **Fix, and the standing rule: never pass a
+  `Get-Content -Raw` result directly into `ConvertTo-Json`.** Either read the file with
+  `[System.IO.File]::ReadAllText` in the first place (this file's existing convention for writes via
+  `[System.IO.File]::WriteAllText` — same API family, same reasoning), or reinterpolate the string
+  first (`"$x"` forces a genuinely new String with no ETS wrapper). An explicit `[string](...)` cast
+  also works — `host.ps1`'s history/registry-reading actions already do this, apparently by
+  convention rather than by having hit this trap — but a bare assignment does not, and the type-check
+  that would normally catch a "wrong type" bug (`.GetType().FullName`) reports `System.String` right
+  up until `ConvertTo-Json` blows up anyway, so this one doesn't announce itself the way most type
+  bugs do.
+- **A JSON message field can't share its name with the dispatch key that routed to it.**
+  `host.ps1`'s `storydoc` case read `$msg.action` for its own sub-action (`init`/`append`/`path`/
+  `show`) — but `$msg.action` was already consumed by the outer `switch ($msg.action)` to route the
+  message to this case in the first place, so it always evaluated to the literal string `"storydoc"`,
+  never what the caller actually asked for. Every call was guaranteed to fail with `"invalid storydoc
+  action: storydoc"` regardless of input — this shipped uncallable and was only caught by a live test
+  the very first time anything actually invoked it (nothing else in this codebase had a reason to
+  reuse `action` for a nested sub-action, which is exactly why this pattern hadn't bitten before).
+  **Fix: name a sub-action field something other than `action`** (`docAction`, here) — obvious once
+  stated, easy to not notice when writing the message shape and the case body in the same sitting.
 - **Build markers** (`[stg]…build:` in popup console, `[stg-bg]…build:` in the SW console,
   `[stg-hist]…build:` in the History tab console, `[stg-opt]…build:` in the Settings tab console)
   are the fast way to verify a reload actually took — bump them when you change behavior.
@@ -553,3 +1077,136 @@ it works — no hand-editing, no second folder full of scripts, no other machine
   call. No browser restart needed; it takes effect on the very next popup action.
 - **`.env` never blocks** removal; **generated files** commonly do (e.g. `src/routeTree.gen.ts`,
   `yarn.lock`) — they show up in the blocked message.
+- **An MV3 service worker's own lifecycle can produce `Uncaught (in promise) Error: No SW`** in
+  `chrome://extensions`'s error console, with no application bug behind it at all — the worker
+  respawning/tearing down mid-call is a normal, expected MV3 event, and a `chrome.*` API call that
+  happens to land during that window rejects. **Caught live**, reported by the user during a P6 plan
+  review: `chrome.tabs.onUpdated`'s auto-route handler only wrapped its final `addTabToStory` call in
+  try/catch, leaving `getSettings()`/`getAllStories()`/`matchStory()` unguarded — any of the three
+  rejecting during a worker respawn surfaced as this exact uncaught error, attributed to the
+  listener's closing brace rather than anything that looked like a real bug. The same gap existed in
+  `chrome.contextMenus.onClicked` (no error handling anywhere in its body) and
+  `chrome.runtime.onMessage`'s IIFE (ended with no `.catch()`, so a case whose logic threw outside
+  its own local try/catch both spammed the console *and* left the caller's `sendMessage` promise
+  hanging forever with no reply). **Fix, and the standing rule: every top-level
+  `chrome.*.addListener(async (...) => {...})` callback in `background.js` needs its *entire* body
+  wrapped**, not just whichever call happens to be last or looks riskiest — `tabs.onUpdated`/
+  `contextMenus.onClicked` swallow (fire-and-forget listeners, nothing for a human to act on), while
+  `onMessage`'s IIFE gets a trailing `.catch()` that still calls `sendResponse` so the caller isn't
+  left hanging.
+- **`chrome.contextMenus.create()` has no promise/throw on error — only an optional callback plus
+  `chrome.runtime.lastError`** — and three independent, uncoordinated triggers all rebuild the
+  right-click "Add to story group" menu (`chrome.runtime.onInstalled`, `chrome.runtime.onStartup`,
+  and `forceRulesRebuild()` after every story mutation). **Caught live** as `Unchecked
+  runtime.lastError: Cannot create item with duplicate id root` in `chrome://extensions`'s error
+  console — a story mutation landing right as the extension reloads (exactly what happens if you
+  toggle the extension Off/On while testing, since that's precisely when `onInstalled` fires) is
+  enough to run two `rebuildMenus()` calls concurrently: the second call's `create({id:'root'})`
+  can land before the first call's own `removeAll()` has caught up, or before the first call's
+  `create({id:'root'})` has landed — either way, a duplicate id. **Fix: `rebuildMenus()` no longer
+  runs directly — every call is queued through one module-level promise chain
+  (`_rebuildMenusChain = _rebuildMenusChain.then(rebuildMenusNow, rebuildMenusNow)`), so a second
+  call always waits for the first to fully finish (its own `removeAll()` included) before starting
+  its own.** Using the same handler for both the resolve and reject branch of `.then()` is what
+  keeps one failed run from wedging every future call behind a permanently-rejected chain — confirmed
+  with a standalone simulation before trusting it, not just reasoned about. `create()` calls also
+  now pass a callback that reads (and discards) `chrome.runtime.lastError`, as defense-in-depth
+  against any duplicate the chain doesn't anticipate — cheap insurance, not the actual fix. **The
+  standing rule this leaves**: any `chrome.*` API with an uncoordinated set of triggers and no
+  native serialization of its own (menus, and anything else that mutates shared browser-side state
+  rather than just reading it) needs an explicit call-chain lock like this one, not just individual
+  error handling at each call site.
+- **`ConvertTo-Json` can turn a genuinely one-line fix into a payload-corrupting one if built by
+  string concatenation instead.** `host.ps1`'s `ledgers` action used to build its JSON reply as
+  `'{' + ($parts -join ',') + '}'`, splicing each ledger file's raw text in unvalidated — one
+  malformed ledger file (a bad manual edit, a write interrupted mid-flush) broke `JSON.parse` for
+  the *entire* combined payload on the JS side, not just that one story's ledger, since the whole
+  point of string concatenation is that PowerShell never gets a chance to validate what it's
+  splicing in. **Fix: parse each ledger independently (`ConvertFrom-Json`, its own try/catch — skip
+  and move on, don't abort), assemble a real `[ordered]` hashtable, and let `ConvertTo-Json`
+  serialize the whole thing once at the end.** A single bad ledger is now just... missing from the
+  reply, the way a missing file already was, instead of taking every other story down with it.
+- **`switch-story.ps1` used to hardcode `origin/main` as every new worktree's base branch** —
+  `New-WorktreeFromMain`'s `git worktree add -b <branch> ... origin/main`. Any repo whose default
+  branch is actually `master` (or anything else) made this fail outright, 100% reproducibly, on
+  *every single story* that touched that app — the popup's only symptom was "`<KEY>` registered,
+  but no worktree was created (`<app>`) — see console", with the actual git error visible only in
+  the popup's own isolated DevTools context (right-click the popup → Inspect → Console →
+  `[stg] create failures:`), not anywhere a first glance would find it. **Caught live**: `git
+  branch -a` on the affected repo showed `remotes/origin/HEAD -> origin/master`, no `origin/main`
+  at all — confirmed as the actual cause by reproducing the identical failure in a scratch repo
+  with the same shape, then confirming the fix resolves it there. **Fix: `Get-DefaultBranch`**
+  (`switch-story.ps1`, next to `Test-BranchExists`) resolves the repo's *real* default branch
+  instead of assuming one — `git symbolic-ref -q --short refs/remotes/origin/HEAD` first (the
+  authoritative source, set by git itself at clone time, correct for *any* naming convention, not
+  just the two common ones), falling back to directly probing for `origin/main` then
+  `origin/master` only if a clone never got `origin/HEAD` set at all. Verified against three real
+  shapes: `main` (the common case, unchanged behavior), `master` (the exact bug — confirmed fixed
+  via the fallback probe), and a deliberately unusual `trunk` with `origin/HEAD` properly set
+  (confirmed fixed via the primary symref path) — so this isn't just "detect master too," it's a
+  genuine "ask the repo what it actually calls its default branch" fix.
+- **A new branch cut from a remote-tracking ref inherits that ref as its own upstream, even though
+  the two have different names** — `git worktree add -b <branch> ... origin/main` (or any base
+  branch) makes `branch.autoSetupMerge`'s default behavior set `<branch>`'s upstream to
+  `origin/main` itself, not a same-named remote branch that doesn't exist yet. A bare `git push`
+  on that brand-new branch then refuses with `"the upstream branch of your current branch does not
+  match the name of your current branch"` — reported live, and confirmed 100% reproducible by
+  git's own design (verified directly: creating a branch the same way with and without `--no-track`
+  in a scratch repo, only the latter avoids the error). **Fix: `--no-track` on the `worktree add`
+  call** — skips setting any upstream at all, so the first `git push` on a new story branch asks
+  for `--set-upstream` once (the normal, expected new-branch prompt) instead of the confusing
+  mismatch error, and every push after that first one works bare. For existing repos already hit by
+  this, `git config --global push.default current` (push the current branch to a same-named remote
+  branch regardless of configured upstream) fixes it globally with no code change, including on
+  branches that already exist with the wrong tracking.
+- **Dot-notation property access on a PowerShell ARRAY checks the array type's own real members
+  BEFORE enumerating each element** — a naming collision, not the already-documented `@($null)` trap
+  (though it produces a similar-looking failure). `setup-dev-loop.ps1`'s first draft built a report
+  array of `[pscustomobject]@{ item = '...'; path = ...; created = ... }` and then read the names
+  back with `$missing.item` / `$created.item`. Since `System.Object[]` (any array) has its own real
+  `Item[int]` indexer property, and PowerShell property lookup is case-insensitive, `.item` resolved
+  to *that* — reflection metadata for the indexer itself — instead of member-enumerating each
+  element's custom `item` key. The JSON reply came back with `OverloadDefinitions`/`MemberType`/
+  `IsSettable` garbage where a plain string list should have been. **Confirmed via the exact
+  mechanism**: the same property name on a `Hashtable` (not an array) works fine, because Hashtable
+  has its own special ETS adapter mapping `.key` to `$hash['key']` that takes priority for
+  Hashtables specifically — arrays have no such adapter, so they fall through to their real .NET
+  members first. **Fix, and the standing rule: never name a custom object property `item` (or
+  anything else that collides with a real member name — `length`, `count`) if code anywhere will
+  read it back via dot-notation off an array of those objects.** Renamed to `name` throughout
+  `New-StgTrackingScaffold` and `setup-dev-loop.ps1`.
+- **`@($null)`'s one-element-array-of-null trap (documented above for `.PSObject.Properties.Name`)
+  recurs through a second, easy-to-miss pathway: dot-notation property access on an EMPTY array also
+  collapses to bare `$null`, not an empty array** — `$missing = @($report | Where-Object {...})`
+  correctly gives a genuinely empty array when nothing matches (wrapping a *pipeline* in `@()`
+  captures its real emitted-object count, zero included), but the very next line's
+  `@($missing.name)` does not: member-enumeration on zero elements returns `$null` as a bare
+  expression, and `@()` around an already-`$null` value can't tell "zero" from "one null" apart any
+  more than it could for `.PSObject.Properties.Name` on an empty object. Caught live: an all-present
+  `setup-dev-loop.ps1 check` on a fully-set-up project reported `"missing":[null]` instead of
+  `"missing":[]`. **Fix: pipe through `ForEach-Object` instead of using dot-notation**
+  (`@($missing | ForEach-Object { $_.name })`) — a pipeline's `@()`-wrap reflects the actual number
+  of emitted objects (zero stays zero), where a scalar-`$null`'s `@()`-wrap never can. Same standing
+  rule as the original trap, extended: it's not just `.PSObject.Properties.Name` that needs
+  `Get-StgNames`-style care — *any* expression that can bottom out at a bare `$null` (property
+  enumeration on an empty collection included) needs a pipeline form before `@()`-wrapping it, not
+  direct member access.
+- **`[Console]::Out.Write()` (this codebase's `-Json` output convention, used by every script with an
+  `Out-Result` helper) bypasses ALL of PowerShell's own redirection when a script is invoked
+  in-process** — `& $scriptPath.ps1 -Json`, `.\$scriptPath.ps1 -Json`, or dot-sourcing all run the
+  script *within the current PowerShell session*, and `[Console]::Out` there is bound to the real,
+  inherited OS console handle, not whatever stream PowerShell's own `|`, `>`, or `$x = ...` capture
+  mechanisms redirect (those only capture the internal "success output" object stream — raw
+  `Console` writes never touch it). The text still prints to the actual terminal (so it's easy to
+  *see* and mistake for a successful capture), but `$x` ends up empty/`$null` and a file redirect
+  (`> out.json`) writes a genuine **zero-byte** file — confirmed directly: `wc -c` on such a file
+  showed 0 bytes even though the JSON had clearly printed to screen moments before. **This is not a
+  codebase bug** — the real, production call path (`native-host\host.ps1`'s `Invoke-StoryScript`)
+  always calls `& powershell.exe -File $script ...`, spawning a genuinely separate OS process, and
+  `[Console]::Out` *there* correctly binds to whatever real stdout handle that child process
+  inherited, which PowerShell's own external-process redirection sets up correctly (this is regular
+  OS-level pipe/handle redirection, unlike the in-process scriptblock case). **The standing rule for
+  testing any `-Json` script here directly** (not through the extension): invoke it the same way
+  `Invoke-StoryScript` does — `& powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
+  -File <script> <args> -Json` — not a bare `& $path` or `.\path`, or `ConvertFrom-Json`/`$x =`
+  against its output will silently look empty with no error to explain why.

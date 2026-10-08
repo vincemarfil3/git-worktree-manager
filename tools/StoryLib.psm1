@@ -59,15 +59,27 @@ function Read-JsonFile {
 }
 
 # ---- registry (stories.json) ------------------------------------------------------------------
-function Get-RegistryPath { param([Parameter(Mandatory)][string]$Root) Join-Path $Root 'stories.json' }
-function Get-HistoryPath  { param([Parameter(Mandatory)][string]$Root) Join-Path $Root 'stories_history.json' }
+# -DocsDir (optional, added for P5 tracking mode): when given, resolves under <Root>\<DocsDir>\
+# instead of bare <Root>\ - a tracking-mode project's registry/history live at
+# <root>\<docsDir>\stories.json (Resolve-StgPaths' own tracking branch, mirrored here), not
+# <root>\stories.json. Every existing caller that never passes it keeps today's exact behavior -
+# found necessary by live testing, not design review: switch-story.ps1 has its own LOCAL
+# Read-Registry/Write-Registry override that already reads $Paths.StoriesPath correctly, but every
+# OTHER script here (story-ledger, story-doctor, story-status, story-release, story-handover,
+# vault-status, remove-worktree's own tracking-mode branch) calls straight through to THIS
+# module's Read-Registry/Invoke-RegistryUpdate/Enter-RegistryLock, which were completely blind to
+# tracking mode until now - confirmed live: story-ledger.ps1 threw "stories.json not found"
+# creating the very first tracking-mode story's ledger, even though the story itself had
+# registered correctly (through switch-story.ps1's own already-correct path).
+function Get-RegistryPath { param([Parameter(Mandatory)][string]$Root, [string]$DocsDir) if ($DocsDir) { Join-Path (Join-Path $Root $DocsDir) 'stories.json' } else { Join-Path $Root 'stories.json' } }
+function Get-HistoryPath  { param([Parameter(Mandatory)][string]$Root, [string]$DocsDir) if ($DocsDir) { Join-Path (Join-Path $Root $DocsDir) 'stories_history.json' } else { Join-Path $Root 'stories_history.json' } }
 
 # stories.json has 5+ writers (switch-story new/log, story-env heal, remove-worktree, and the
 # browser extension's native host) with no coordination - an overlap silently discards a node.
 # Every mutation goes through this: exclusive lock, read UNDER the lock, mutate, write, release.
 function Enter-RegistryLock {
-  param([Parameter(Mandatory)][string]$Root, [int]$TimeoutMs = 4000)
-  $lockPath = (Get-RegistryPath -Root $Root) + '.lock'
+  param([Parameter(Mandatory)][string]$Root, [string]$DocsDir, [int]$TimeoutMs = 4000)
+  $lockPath = (Get-RegistryPath -Root $Root -DocsDir $DocsDir) + '.lock'
   $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
   do {
     try {
@@ -84,8 +96,8 @@ function Exit-RegistryLock {
 }
 
 function Read-Registry {
-  param([Parameter(Mandatory)][string]$Root)
-  $p = Get-RegistryPath -Root $Root
+  param([Parameter(Mandatory)][string]$Root, [string]$DocsDir)
+  $p = Get-RegistryPath -Root $Root -DocsDir $DocsDir
   if (-not (Test-Path -LiteralPath $p)) { throw "stories.json not found at $p" }
   return Read-JsonFile -Path $p
 }
@@ -94,14 +106,15 @@ function Read-Registry {
 function Invoke-RegistryUpdate {
   param(
     [Parameter(Mandatory)][string]$Root,
+    [string]$DocsDir,
     [Parameter(Mandatory)][scriptblock]$Mutate,
     [int]$Depth = 12
   )
-  $lock = Enter-RegistryLock -Root $Root
+  $lock = Enter-RegistryLock -Root $Root -DocsDir $DocsDir
   try {
-    $reg = Read-Registry -Root $Root
+    $reg = Read-Registry -Root $Root -DocsDir $DocsDir
     $write = & $Mutate $reg
-    if ($write -ne $false) { Write-JsonFile -Path (Get-RegistryPath -Root $Root) -Obj $reg -Depth $Depth }
+    if ($write -ne $false) { Write-JsonFile -Path (Get-RegistryPath -Root $Root -DocsDir $DocsDir) -Obj $reg -Depth $Depth }
     return $reg
   }
   finally { Exit-RegistryLock $lock }

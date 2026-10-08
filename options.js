@@ -1,6 +1,155 @@
 const $ = (s) => document.querySelector(s);
 const send = (m) => new Promise((r) => chrome.runtime.sendMessage(m, r));
 
+// Every "Saved ✓" / "Error: ..." message span on this page used to render as identical grey text
+// (the .note class, no success/error distinction at all) - this is the shared setter that colors
+// them via the .note.ok / .note.err CSS added for the visual redesign. Purely a display concern:
+// it doesn't change what any handler decides to do, only how the same already-computed text shows.
+function setMsg(el, text, kind) {
+  if (!el) return;
+  el.textContent = text || '';
+  el.classList.remove('ok', 'err');
+  if (kind === 'ok') el.classList.add('ok');
+  else if (kind === 'err') el.classList.add('err');
+}
+
+// ---------- Projects ----------
+// "Worktree paths & branch format", "Organization settings" and "Apps" below all read/write the
+// ACTIVE project (ACTIVE_PROJECT, set from loadProjectsCard()'s getProjects reply) - the same
+// project the popup itself shows/acts on. An earlier version had an independent "Editing settings
+// for" <select> here, decoupled from active, so you could edit a project without switching to it -
+// removed at the user's request after live-testing it alongside the popup's own now-removed
+// dropdown: two different notions of "which project" on one page (one here, one everywhere else)
+// tested as confusing, the same reason popup.js's #projSel became a plain label. To edit a
+// different project now, Set active it on the Projects card first - #settingsProjLabel (read-only)
+// just names whichever one that currently is. ACTIVE_PROJECT null means "no project context" -
+// either a fresh install with zero projects configured yet, or every project having been removed -
+// in which case these three cards fall back to the pre-multi-project getStgConfig/setStgConfig/
+// getApps path exactly as before this feature existed (see renderConfig/renderApps/the Save
+// handlers below).
+let PROJECTS_ROWS = [];
+
+function paintProjectsCard() {
+  const el = $('#projectsList');
+  if (!PROJECTS_ROWS.length) {
+    el.innerHTML = '<div class="note">No projects configured yet — add one below, or run <code>setup.ps1</code> from the extension folder.</div>';
+    return;
+  }
+  el.innerHTML = PROJECTS_ROWS.map((p) => {
+    const isActive = p.id === ACTIVE_PROJECT;
+    const modeTag = `<span class="tag">${esc(p.mode || 'worktree')}</span>`;
+    const activeTag = isActive ? '<span class="tag active-flag">★ active</span>' : '';
+    const warnTag = p.needsSetup ? `<span class="tag warn" title="${esc(p.error || '')}">needs setup</span>` : '';
+    return `<div class="approw" data-projid="${esc(p.id)}">
+      <div class="approw-head">
+        <span class="approw-name">${esc(p.name || p.id)}</span>
+        ${modeTag}${activeTag}${warnTag}
+      </div>
+      <div class="approw-fields">
+        <input type="text" class="f-start" data-projname-input value="${esc(p.name || '')}" placeholder="project name" />
+        <span class="note" style="flex:1; word-break:break-all">${esc(p.root || '')}</span>
+        <div class="approw-actions">
+          ${!isActive ? `<button class="ghost btn-xs" data-setactive="${esc(p.id)}">Set active</button>` : ''}
+          <button class="ghost btn-xs" data-renameproj="${esc(p.id)}">Rename</button>
+          <button class="danger btn-xs" data-removeproj="${esc(p.id)}">Remove</button>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+let ACTIVE_PROJECT = null;
+
+function paintSettingsProjLabel() {
+  const label = $('#settingsProjLabel');
+  const row = $('#settingsProjRow');
+  if (!PROJECTS_ROWS.length) { row.hidden = true; return; }
+  row.hidden = false;
+  const cur = PROJECTS_ROWS.find((p) => p.id === ACTIVE_PROJECT);
+  label.textContent = cur ? (cur.name || cur.id) : '(unknown project)';
+}
+
+async function loadProjectsCard() {
+  let res;
+  try { res = await send({ type: 'getProjects' }); } catch (e) { res = { ok: false, error: String(e) }; }
+  if (!res || !res.ok) {
+    $('#projectsList').innerHTML = `<div class="note">Error: ${esc((res && res.error) || 'could not list projects')}</div>`;
+    return;
+  }
+  PROJECTS_ROWS = Array.isArray(res.projects) ? res.projects : [];
+  ACTIVE_PROJECT = res.activeProject || null;
+  paintProjectsCard();
+  paintSettingsProjLabel();
+}
+
+// Switching the active project invalidates everything the three per-project cards below are
+// showing (they now edit whichever project IS active) - refresh all of them together, same
+// "full re-fetch on switch" reasoning popup.js's own active-project handling uses.
+async function refreshProjectScopedCards() {
+  await Promise.all([renderConfig(), renderApps(), renderAgentCard()]);
+}
+
+document.addEventListener('click', async (e) => {
+  const setActiveBtn = e.target.closest('[data-setactive]');
+  if (setActiveBtn) {
+    setMsg($('#projectsMsg'), 'Switching…');
+    const res = await send({ type: 'setStgConfig', activeProject: setActiveBtn.dataset.setactive });
+    setMsg($('#projectsMsg'), (res && res.ok) ? 'Active project switched ✓' : ('Error: ' + ((res && res.error) || 'unknown')), (res && res.ok) ? 'ok' : 'err');
+    await loadProjectsCard();
+    await refreshProjectScopedCards(); // Worktree paths/Org settings/Apps now edit the NEW active project
+    await renderDiagnostics(); // Paths & diagnostics stays scoped to the ACTIVE project too
+    return;
+  }
+  const renameBtn = e.target.closest('[data-renameproj]');
+  if (renameBtn) {
+    const row = renameBtn.closest('.approw');
+    const nameInput = row.querySelector('[data-projname-input]');
+    const newName = (nameInput.value || '').trim();
+    if (!newName) { setMsg($('#projectsMsg'), 'Project name cannot be blank', 'err'); return; }
+    setMsg($('#projectsMsg'), 'Saving…');
+    const res = await send({ type: 'setProjectConfig', id: renameBtn.dataset.renameproj, name: newName });
+    setMsg($('#projectsMsg'), (res && res.ok) ? 'Renamed ✓' : ('Error: ' + ((res && res.error) || 'unknown')), (res && res.ok) ? 'ok' : 'err');
+    await loadProjectsCard();
+    return;
+  }
+  const removeBtn = e.target.closest('[data-removeproj]');
+  if (removeBtn) {
+    const id = removeBtn.dataset.removeproj;
+    const proj = PROJECTS_ROWS.find((p) => p.id === id);
+    if (!confirm(`Remove "${(proj && proj.name) || id}" from this extension? stories.json, worktrees and the repo itself are never touched — this only forgets the extension's reference to it.`)) return;
+    setMsg($('#projectsMsg'), 'Removing…');
+    const res = await send({ type: 'removeProject', id });
+    setMsg($('#projectsMsg'), (res && res.ok) ? 'Removed ✓' : ('Error: ' + ((res && res.error) || 'unknown')), (res && res.ok) ? 'ok' : 'err');
+    await loadProjectsCard();
+    await refreshProjectScopedCards();
+    await renderDiagnostics();
+    return;
+  }
+});
+
+$('#projAddBtn').onclick = async () => {
+  const name = $('#projNewName').value.trim();
+  const root = $('#projNewRoot').value.trim();
+  const mode = $('#projNewMode').value || 'worktree';
+  setMsg($('#projectsMsg'), '');
+  if (!name) { setMsg($('#projectsMsg'), 'Enter a project name first', 'err'); return; }
+  if (!root) { setMsg($('#projectsMsg'), 'Enter a root folder first', 'err'); return; }
+  setMsg($('#projectsMsg'), 'Adding…');
+  const res = await send({ type: 'addProject', name, root, mode });
+  if (res && res.ok) {
+    $('#projNewName').value = '';
+    $('#projNewRoot').value = '';
+    $('#projNewMode').value = 'worktree';
+    setMsg($('#projectsMsg'), 'Added ✓', 'ok');
+    await loadProjectsCard();
+    await refreshProjectScopedCards();
+    await renderDiagnostics();
+  } else {
+    const hint = res && res.nativeHostMissing ? ' — native host unreachable' : '';
+    setMsg($('#projectsMsg'), 'Error: ' + ((res && res.error) || 'unknown') + hint, 'err');
+  }
+};
+
 // Rule-building + file handling live in rules-lib.js (window.RB), shared with the popup.
 
 // Native host status - can't fix the connection with a click (Chrome refuses to let an extension
@@ -38,15 +187,77 @@ async function checkHostStatus() {
 }
 
 $('#hostRecheck').onclick = checkHostStatus;
-$('#hostCopyBtn').onclick = async () => {
+
+// Shared by every "copy to clipboard" button on this page - the Native host card's fix command,
+// and the Agent integration card's AGENTS.md snippet / Copy instructions buttons below. A second
+// and third consumer arriving in the same phase is exactly the point where copy-pasting this a
+// second time stops being the cheaper option.
+async function copyText(text, msgEl) {
   try {
-    await navigator.clipboard.writeText($('#hostCmd').textContent);
-    $('#hostCopyMsg').textContent = 'Copied ✓';
-    setTimeout(() => { $('#hostCopyMsg').textContent = ''; }, 1600);
+    await navigator.clipboard.writeText(text);
+    setMsg(msgEl, 'Copied ✓', 'ok');
+    setTimeout(() => { setMsg(msgEl, ''); }, 1600);
   } catch (e) {
-    $('#hostCopyMsg').textContent = 'Copy failed — select the text and copy manually';
+    setMsg(msgEl, 'Copy failed — select the text and copy manually', 'err');
+  }
+}
+$('#hostCopyBtn').onclick = () => copyText($('#hostCmd').textContent, $('#hostCopyMsg'));
+
+// ---------- Agent integration ----------
+// Renders (installskill install:false) to show devCycleDetected + the current project name -
+// read-only, no write, safe to call on every card refresh (project switch, page load). Installing
+// (install:true) is a deliberate button click only.
+async function renderAgentCard() {
+  const cur = PROJECTS_ROWS.find((p) => p.id === ACTIVE_PROJECT);
+  $('#agentProjLabel').textContent = cur ? (cur.name || cur.id) : '(no project configured)';
+  $('#agentInstallStatus').textContent = '';
+  $('#agentDevCycleStatus').textContent = '';
+  if (!ACTIVE_PROJECT) return;
+  let res;
+  try { res = await send({ type: 'installSkill', install: false }); } catch (e) { res = null; }
+  if (!res || !res.ok) {
+    $('#agentDevCycleStatus').textContent = (res && res.error) ? `Could not check dev-cycle: ${res.error}` : '';
+    return;
+  }
+  if (res.devCycleDetected) {
+    $('#agentDevCycleStatus').innerHTML = '<b>dev-cycle harness: found</b> — the skill will mirror its phase transitions into the ledger, best-effort.';
+  } else {
+    $('#agentDevCycleStatus').innerHTML = '<b>dev-cycle harness: not found</b> — nothing to mirror. '
+      + '<span class="src">Run the dev-cycle skill here to bootstrap it, if you want that too.</span>';
+  }
+}
+
+$('#agentInstallBtn').onclick = async () => {
+  const scope = $('#agentScope').value;
+  setMsg($('#agentInstallStatus'), 'Installing…');
+  let res;
+  try { res = await send({ type: 'installSkill', install: true, scope }); } catch (e) { res = { ok: false, error: String(e) }; }
+  if (res && res.ok) {
+    $('#agentInstallStatus').innerHTML = `<span class="pill gen">✓ installed</span> <span class="note">${esc(res.path || '')}</span>`;
+  } else {
+    const hint = res && res.nativeHostMissing ? ' — native host unreachable' : '';
+    setMsg($('#agentInstallStatus'), 'Error: ' + ((res && res.error) || 'unknown') + hint, 'err');
+  }
+  // Same reply also carries devCycleDetected - no separate round trip needed to refresh that line.
+  if (res && res.ok) {
+    $('#agentDevCycleStatus').innerHTML = res.devCycleDetected
+      ? '<b>dev-cycle harness: found</b> — the skill will mirror its phase transitions into the ledger, best-effort.'
+      : '<b>dev-cycle harness: not found</b> — nothing to mirror. <span class="src">Run the dev-cycle skill here to bootstrap it, if you want that too.</span>';
   }
 };
+
+async function copyRenderedSkill(msgEl) {
+  setMsg(msgEl, 'Rendering…');
+  let res;
+  try { res = await send({ type: 'installSkill', install: false }); } catch (e) { res = { ok: false, error: String(e) }; }
+  if (!res || !res.ok) {
+    setMsg(msgEl, 'Error: ' + ((res && res.error) || 'unknown'), 'err');
+    return;
+  }
+  await copyText(res.content, msgEl);
+}
+$('#agentCopyAgentsBtn').onclick = () => copyRenderedSkill($('#agentCopyMsg'));
+$('#agentCopyInstructionsBtn').onclick = () => copyRenderedSkill($('#agentCopyMsg'));
 
 // Every "Help" pointer on this page opens the same page, in a new tab — the full step-by-step
 // install/troubleshooting guide this page intentionally doesn't repeat inline.
@@ -59,23 +270,28 @@ for (const id of ['helpLink', 'hostHelpLink', 'diagHelpLink']) {
 checkHostStatus();
 
 $('#loadFile').onclick = async () => {
-  $('#loadMsg').textContent = '';
+  setMsg($('#loadMsg'), '');
   if (!window.showOpenFilePicker) {
-    $('#loadMsg').textContent = 'Your Chrome is too old for the file picker — use Advanced instead.';
+    setMsg($('#loadMsg'), 'Your Chrome is too old for the file picker — use the paste-a-rules.json box below instead.', 'err');
     return;
   }
   try {
     const res = await RB.sync(); // picks if needed; safe here (the Options page survives the dialog)
-    $('#loadMsg').textContent = `Loaded ${res.count} stories ✓`;
+    setMsg($('#loadMsg'), `Loaded ${res.count} stories ✓`, 'ok');
     render();
   } catch (e) {
-    if (e.name !== 'AbortError') $('#loadMsg').textContent = 'Error: ' + e.message;
+    if (e.name !== 'AbortError') setMsg($('#loadMsg'), 'Error: ' + e.message, 'err');
   }
 };
 
 async function render() {
   const state = await send({ type: 'getState' });
-  const { rulesOverride } = await chrome.storage.local.get('rulesOverride');
+  // rulesOverrides (plural, keyed by project id) - not the legacy flat 'rulesOverride' key, which
+  // nothing has written since background.js moved to the per-project map (P4.8). Reading the old
+  // key meant this pill always said "from stories.json" regardless of whether a real override was
+  // active for the current project.
+  const { rulesOverrides = {} } = await chrome.storage.local.get('rulesOverrides');
+  const rulesOverride = rulesOverrides[ACTIVE_PROJECT];
   const stories = (state && state.stories) || [];
 
   $('#source').innerHTML = rulesOverride
@@ -112,31 +328,43 @@ $('#save').onclick = async () => {
     const r = JSON.parse($('#rules').value);
     if (!Array.isArray(r.stories)) throw new Error('missing "stories" array');
     await send({ type: 'saveRulesOverride', rules: r });
-    $('#msg').textContent = 'Saved ✓';
+    setMsg($('#msg'), 'Saved ✓', 'ok');
     render();
   } catch (e) {
-    $('#msg').textContent = 'Invalid JSON: ' + e.message;
+    setMsg($('#msg'), 'Invalid JSON: ' + e.message, 'err');
   }
 };
 
 $('#clear').onclick = async () => {
   await send({ type: 'clearRulesOverride' });
   $('#rules').value = '';
-  $('#msg').textContent = 'Cleared ✓';
+  setMsg($('#msg'), 'Cleared ✓', 'ok');
   render();
 };
 
 // Worktree paths & branch format — root / worktreeRoot / workspaceRoot / branchFormat, persisted
 // by the native host next to itself (survives even if the Options page's own chrome.storage were
 // ever cleared) - see stg-paths.psm1 for the single resolver both this page and every tools\*.ps1
-// script read through.
+// script read through. Organization settings share this same reply/round trip.
+//
+// Project-scoped via getProjectConfig once ACTIVE_PROJECT is set (the normal case - P1's
+// migration always synthesizes a project once a root exists) - reads THE ACTIVE project's own
+// fields directly by id, rather than relying on getStgConfig's top-level mirror, so a Save here
+// can never race a mirror that's mid-refresh from a just-fired Set active click. Falls back to the
+// legacy getStgConfig only when there's genuinely no project context at all (zero projects
+// configured, e.g. a fresh install or every project removed) - same fallback Resolve-StgPaths
+// itself uses server-side.
 async function renderConfig() {
   let res;
-  try { res = await send({ type: 'getStgConfig' }); } catch (e) { res = { ok: false, error: String(e) }; }
+  try {
+    res = ACTIVE_PROJECT
+      ? await send({ type: 'getProjectConfig', id: ACTIVE_PROJECT })
+      : await send({ type: 'getStgConfig' });
+  } catch (e) { res = { ok: false, error: String(e) }; }
   if (!res || !res.ok) {
-    $('#cfgMsg').textContent = (res && res.nativeHostMissing)
+    setMsg($('#cfgMsg'), (res && res.nativeHostMissing)
       ? 'native host unreachable — install it first (see native-host/README.md)'
-      : 'Error: ' + ((res && res.error) || 'could not read settings');
+      : 'Error: ' + ((res && res.error) || 'could not read settings'), 'err');
     return res;
   }
   $('#cfgRoot').value = res.root || '';
@@ -145,9 +373,11 @@ async function renderConfig() {
   $('#cfgWorktreeRoot').placeholder = res.worktreeRoot ? 'same as Story root' : `currently: ${res.effectiveWorktreeRoot || ''}`;
   $('#cfgWorkspaceRoot').value = res.workspaceRoot || '';
   $('#cfgWorkspaceRoot').placeholder = res.workspaceRoot ? 'auto' : `currently: ${res.effectiveWorkspaceRoot || ''}`;
+  $('#cfgReposRoot').value = res.reposRoot || '';
+  $('#cfgReposRoot').placeholder = res.reposRoot ? 'same as Story root' : `currently: ${res.effectiveReposRoot || ''}`;
   $('#cfgBranchFormat').value = res.branchFormat || '';
   $('#cfgBranchFormat').placeholder = res.effectiveBranchFormat || 'feature/{env}/{key}';
-  $('#cfgMsg').textContent = '';
+  setMsg($('#cfgMsg'), '');
 
   // Organization settings share the same getConfig reply - one round trip for both cards.
   $('#orgJira').value = res.jiraBaseUrl || '';
@@ -160,56 +390,66 @@ async function renderConfig() {
   $('#orgOwner').placeholder = 'your Windows username';
   $('#orgRepoAliases').value = (res.repoAliases && Object.keys(res.repoAliases).length) ? JSON.stringify(res.repoAliases) : '';
   $('#orgRepoAliases').placeholder = '{"ganesha-iu-internal-app":"ganesha-ui-internal-app"}';
-  $('#orgMsg').textContent = '';
+  setMsg($('#orgMsg'), '');
 
   return res;
 }
 
 $('#cfgSave').onclick = async () => {
-  $('#cfgMsg').textContent = 'Saving…';
-  const res = await send({
-    type: 'setStgConfig',
+  setMsg($('#cfgMsg'), 'Saving…');
+  const fields = {
     root: $('#cfgRoot').value.trim(),
     worktreeRoot: $('#cfgWorktreeRoot').value.trim(),
     workspaceRoot: $('#cfgWorkspaceRoot').value.trim(),
+    reposRoot: $('#cfgReposRoot').value.trim(),
     branchFormat: $('#cfgBranchFormat').value.trim(),
-  });
+  };
+  const res = ACTIVE_PROJECT
+    ? await send({ type: 'setProjectConfig', id: ACTIVE_PROJECT, ...fields })
+    : await send({ type: 'setStgConfig', ...fields });
   if (res && res.ok) {
-    $('#cfgMsg').textContent = 'Saved ✓';
-    renderConfig();
-    renderDiagnostics();
+    setMsg($('#cfgMsg'), 'Saved ✓', 'ok');
+    // refreshProjectScopedCards(), not just renderConfig() - a changed Root used to leave the Apps
+    // card listing the OLD root's clones until something else happened to repaint it. Root's own
+    // 'config' vs 'same as Root' source label above also depends on this, so cfgSave and Root
+    // changing are the same event either way.
+    await refreshProjectScopedCards();
+    await renderDiagnostics();
+    await loadProjectsCard(); // root may have changed - the Projects card's own row shows it too
   } else {
     const hint = res && res.nativeHostMissing ? ' — native host unreachable' : '';
-    $('#cfgMsg').textContent = 'Error: ' + ((res && res.error) || 'unknown') + hint;
+    setMsg($('#cfgMsg'), 'Error: ' + ((res && res.error) || 'unknown') + hint, 'err');
   }
 };
 
 $('#orgSave').onclick = async () => {
-  $('#orgMsg').textContent = 'Saving…';
+  setMsg($('#orgMsg'), 'Saving…');
   let repoAliases;
   const raw = $('#orgRepoAliases').value.trim();
   if (raw) {
     try { repoAliases = JSON.parse(raw); } catch (e) {
-      $('#orgMsg').textContent = 'Invalid JSON in repo aliases: ' + e.message;
+      setMsg($('#orgMsg'), 'Invalid JSON in repo aliases: ' + e.message, 'err');
       return;
     }
   } else {
     repoAliases = '';
   }
-  const res = await send({
-    type: 'setStgConfig',
+  const fields = {
     jiraBaseUrl: $('#orgJira').value.trim(),
     githubOrg: $('#orgGithub').value.trim(),
     taskNamePrefix: $('#orgTaskPrefix').value.trim(),
     owner: $('#orgOwner').value.trim(),
     repoAliases,
-  });
+  };
+  const res = ACTIVE_PROJECT
+    ? await send({ type: 'setProjectConfig', id: ACTIVE_PROJECT, ...fields })
+    : await send({ type: 'setStgConfig', ...fields });
   if (res && res.ok) {
-    $('#orgMsg').textContent = 'Saved ✓';
+    setMsg($('#orgMsg'), 'Saved ✓', 'ok');
     renderConfig();
   } else {
     const hint = res && res.nativeHostMissing ? ' — native host unreachable' : '';
-    $('#orgMsg').textContent = 'Error: ' + ((res && res.error) || 'unknown') + hint;
+    setMsg($('#orgMsg'), 'Error: ' + ((res && res.error) || 'unknown') + hint, 'err');
   }
 };
 
@@ -225,29 +465,81 @@ function diagRow(name, val, ok, src, fix) {
 }
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 
+function diagRollup(ok, problems, projName) {
+  const el = $('#diagRollup');
+  if (!el) return;
+  if (ok) {
+    el.innerHTML = `<span class="ok-y">✓</span> ${esc(projName || '')} · all checks passed`;
+  } else {
+    const list = problems.slice(0, 3).join(', ') + (problems.length > 3 ? `, +${problems.length - 3} more` : '');
+    el.innerHTML = `<span class="ok-n">✕</span> ${esc(projName || '')} · ${problems.length} problem${problems.length === 1 ? '' : 's'}: ${esc(list)}`;
+  }
+}
+
 async function renderDiagnostics() {
-  $('#diagMsg').textContent = 'Checking…';
+  setMsg($('#diagMsg'), 'Checking…');
+  const cur = PROJECTS_ROWS.find((p) => p.id === ACTIVE_PROJECT);
+  const projName = cur ? (cur.name || cur.id) : '';
   const cfg = await send({ type: 'getStgConfig' });
   const rows = [];
   if (!cfg || !cfg.ok) {
-    rows.push(diagRow('Root', null, false, null));
     $('#diagTable').innerHTML = `<tbody>${diagRow('Native host', (cfg && cfg.error) || 'unreachable', false, null)}</tbody>`;
-    $('#diagMsg').textContent = cfg && cfg.nativeHostMissing ? 'native host unreachable' : ((cfg && cfg.error) || 'error');
+    const msg = cfg && cfg.nativeHostMissing ? 'native host unreachable' : ((cfg && cfg.error) || 'error');
+    setMsg($('#diagMsg'), msg, 'err');
+    diagRollup(false, [msg], projName);
+    $('#diagDetails').open = true;
     return;
   }
   rows.push(diagRow('Root', cfg.effectiveRoot, !cfg.needsSetup, cfg.rootSource));
-  rows.push(diagRow('Worktree root', cfg.effectiveWorktreeRoot, !cfg.needsSetup, cfg.worktreeRoot ? 'config' : 'same as Root'));
-  rows.push(diagRow('Workspace dir', cfg.effectiveWorkspaceRoot, !cfg.needsSetup, cfg.workspaceRoot ? 'config' : 'auto'));
   rows.push(diagRow('Scripts dir (tools\\)', cfg.scriptsDir, true, 'extension folder'));
   rows.push(diagRow('Config file', cfg.configPath, true, '%LOCALAPPDATA%'));
 
   let pf;
   try { pf = await send({ type: 'runPreflight' }); } catch (e) { pf = { ok: false, error: String(e) }; }
+
   if (pf && Array.isArray(pf.checks)) {
-    for (const c of pf.checks) rows.push(diagRow(c.name, c.detail, c.ok, null, c.fix));
+    // Worktree root / workspace dir now have a REAL existence check behind them (host.ps1's
+    // preflight action) instead of the old '!cfg.needsSetup' proxy, which reflected whether Root
+    // was configured, not whether these specific paths actually exist. Pulled out of the generic
+    // loop below so they render right after Root, in the position they've always had, with the
+    // path itself as the value and 'config'/'auto' still shown as their source - the generic loop
+    // skips these two by name so they don't render twice. Absent entirely for a tracking-mode
+    // project (host.ps1 only emits them for worktree mode, since both paths are null there by
+    // design) - nothing to show, not a failed check.
+    const wtCheck = pf.checks.find((c) => c.name === 'Worktree root exists');
+    if (wtCheck) rows.push(diagRow('Worktree root', wtCheck.detail, wtCheck.ok, cfg.worktreeRoot ? 'config' : 'same as Root', wtCheck.fix));
+    const wsCheck = pf.checks.find((c) => c.name === 'Workspace dir exists');
+    if (wsCheck) rows.push(diagRow('Workspace dir', wsCheck.detail, wsCheck.ok, cfg.workspaceRoot ? 'config' : 'auto', wsCheck.fix));
+    for (const c of pf.checks) {
+      if (c.name === 'Worktree root exists' || c.name === 'Workspace dir exists') continue;
+      rows.push(diagRow(c.name, c.detail, c.ok, null, c.fix));
+    }
   }
   $('#diagTable').innerHTML = `<tbody>${rows.join('')}</tbody>`;
-  $('#diagMsg').textContent = (pf && pf.ok) || (!pf) ? '' : 'some checks failed — the fix for each is shown under it above';
+
+  // Same two checks host.ps1's own preflight action treats as optional (code CLI / app-map.json) -
+  // the roll-up must agree, or a machine with no VS Code CLI installed would show a permanent,
+  // misleading ✕ every time.
+  const OPTIONAL = new Set(['code (VS Code CLI) on PATH', 'app-map.json']);
+  if (!pf || !Array.isArray(pf.checks) || !pf.checks.length) {
+    const msg = (pf && pf.error) || 'preflight did not return any checks';
+    setMsg($('#diagMsg'), msg, 'err');
+    diagRollup(false, [msg], projName);
+    $('#diagDetails').open = true;
+  } else {
+    const failed = pf.checks.filter((c) => !c.ok && !OPTIONAL.has(c.name));
+    if (failed.length) {
+      setMsg($('#diagMsg'), 'some checks failed — the fix for each is shown under it above', 'err');
+      diagRollup(false, failed.map((c) => c.name), projName);
+      $('#diagDetails').open = true;
+    } else {
+      setMsg($('#diagMsg'), '');
+      diagRollup(true, [], projName);
+      // Deliberately does NOT force-collapse an already-open details on a clean re-check - only
+      // the initial "everything's fine" render should default to collapsed; a user who opened it
+      // themselves to look something up shouldn't have it yanked shut under them by Re-run preflight.
+    }
+  }
 }
 $('#diagRecheck').onclick = renderDiagnostics;
 
@@ -309,10 +601,22 @@ function paintApps() {
 async function renderApps() {
   const el = $('#appsList');
   let res;
-  try { res = await send({ type: 'getApps' }); } catch (e) { res = { ok: false, error: String(e) }; }
+  // project: ACTIVE_PROJECT - a repo scan + app-map read is per-project (see host.ps1's 'apps'
+  // action, which resolves $GRoot/$PathsInfo.AppMapPath from whichever project msg.project names).
+  // null/undefined here means "no project context" and the host falls back to whatever
+  // Resolve-StgPaths' legacy chain resolves, same as every other project-scoped call in this file.
+  try { res = await send({ type: 'getApps', project: ACTIVE_PROJECT }); } catch (e) { res = { ok: false, error: String(e) }; }
   if (!res || !res.ok) {
     const hint = res && res.nativeHostMissing ? ' — native host unreachable' : '';
     el.innerHTML = `<div class="note">Error: ${esc((res && res.error) || 'could not list apps')}${esc(hint)}</div>`;
+    return;
+  }
+  // Tracking mode has no app/worktree concept at all - host.ps1's 'apps' action already
+  // short-circuits before its disk scan and says so via mode:'tracking'. Show that plainly rather
+  // than an empty checklist that looks like "nothing found" instead of "not applicable here".
+  if (res.mode === 'tracking') {
+    el.innerHTML = '<div class="note">This project is in <b>tracking</b> mode - no worktrees or apps to map. (Apps only applies to worktree-mode projects.)</div>';
+    appsRows = []; appsMap = {}; appsHidden = new Set();
     return;
   }
   appsRows = Array.isArray(res.apps) ? res.apps : [];
@@ -342,11 +646,11 @@ document.addEventListener('click', (e) => {
 
 $('#appAddBtn').onclick = () => {
   const name = $('#appNewName').value.trim();
-  $('#appsMsg').textContent = '';
-  if (!name) { $('#appsMsg').textContent = 'Enter an app name first'; return; }
-  if (/[\\/]/.test(name)) { $('#appsMsg').textContent = "App name can't contain \\ or /"; return; }
+  setMsg($('#appsMsg'), '');
+  if (!name) { setMsg($('#appsMsg'), 'Enter an app name first', 'err'); return; }
+  if (/[\\/]/.test(name)) { setMsg($('#appsMsg'), "App name can't contain \\ or /", 'err'); return; }
   const port = $('#appNewPort').value.trim();
-  if (port && !/^\d+$/.test(port)) { $('#appsMsg').textContent = 'Port must be a number'; return; }
+  if (port && !/^\d+$/.test(port)) { setMsg($('#appsMsg'), 'Port must be a number', 'err'); return; }
   syncAppFieldsFromDom();
   appsMap[name] = { port, start: $('#appNewStart').value.trim(), health: $('#appNewHealth').value.trim() };
   ['appNewName', 'appNewPort', 'appNewStart', 'appNewHealth'].forEach((id) => { $('#' + id).value = ''; });
@@ -359,9 +663,9 @@ $('#appsSave').onclick = async () => {
   // field - client-side, so a typo shows up here instead of round-tripping to the host's own
   // TryParse guard for an "invalid port for X" error.
   for (const [name, def] of Object.entries(appsMap)) {
-    if (def.port && !/^\d+$/.test(def.port)) { $('#appsMsg').textContent = `Port for ${name} must be a number`; return; }
+    if (def.port && !/^\d+$/.test(def.port)) { setMsg($('#appsMsg'), `Port for ${name} must be a number`, 'err'); return; }
   }
-  $('#appsMsg').textContent = 'Saving…';
+  setMsg($('#appsMsg'), 'Saving…');
   const payload = {};
   for (const [name, def] of Object.entries(appsMap)) {
     const entry = {};
@@ -370,27 +674,34 @@ $('#appsSave').onclick = async () => {
     if (def.health) entry.health = def.health;
     payload[name] = entry;
   }
-  const mapRes = await send({ type: 'setAppMap', apps: payload });
+  const mapRes = await send({ type: 'setAppMap', project: ACTIVE_PROJECT, apps: payload });
   if (!mapRes || !mapRes.ok) {
     const hint = mapRes && mapRes.nativeHostMissing ? ' — native host unreachable' : '';
-    $('#appsMsg').textContent = 'Error: ' + ((mapRes && mapRes.error) || 'unknown') + hint;
+    setMsg($('#appsMsg'), 'Error: ' + ((mapRes && mapRes.error) || 'unknown') + hint, 'err');
     return;
   }
-  // hiddenApps is a separate config key (setStgConfig), sent alongside on the same Save click -
-  // one user action, one commit of everything staged in this card.
-  const hideRes = await send({ type: 'setStgConfig', hiddenApps: [...appsHidden] });
+  // hiddenApps is a separate config key, sent alongside on the same Save click - one user action,
+  // one commit of everything staged in this card. Project-scoped via setProjectConfig the same way
+  // the two cards above are; falls back to the legacy setStgConfig only with no project context.
+  const hideRes = ACTIVE_PROJECT
+    ? await send({ type: 'setProjectConfig', id: ACTIVE_PROJECT, hiddenApps: [...appsHidden] })
+    : await send({ type: 'setStgConfig', hiddenApps: [...appsHidden] });
   if (!hideRes || !hideRes.ok) {
     const hint = hideRes && hideRes.nativeHostMissing ? ' — native host unreachable' : '';
-    $('#appsMsg').textContent = 'Saved apps, but hidden list failed: ' + ((hideRes && hideRes.error) || 'unknown') + hint;
+    setMsg($('#appsMsg'), 'Saved apps, but hidden list failed: ' + ((hideRes && hideRes.error) || 'unknown') + hint, 'err');
     return;
   }
-  $('#appsMsg').textContent = 'Saved ✓';
+  setMsg($('#appsMsg'), 'Saved ✓', 'ok');
   await renderApps();
 };
 
-console.log('[stg-opt] options build: v3 (Apps card: Hide/Remove sit inline with the port/start/health row; the +Add row now sits flush against the Save button below it, no gap)');
+console.log('[stg-opt] options build: v10 (visual redesign: real color tokens (--success/--warn/--danger) replace scattered hex/an unused --green, a real type scale with sentence-case headers instead of the dim ALL-CAPS eyebrow treatment, hover/focus states and styled links added page-wide, Remove/Clear override now read as destructive, a shared setMsg() helper colors every Saved/Error message instead of them all rendering as identical grey text)');
 
 render();
-renderConfig();
-renderDiagnostics();
-renderApps();
+// loadProjectsCard() first and awaited - it's what sets ACTIVE_PROJECT, which renderConfig()/
+// renderApps() both need on their very first call to know which project to read.
+(async () => {
+  await loadProjectsCard();
+  await renderDiagnostics(); // also active-project-scoped, same project as everything else now
+  await refreshProjectScopedCards();
+})();
