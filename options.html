@@ -281,6 +281,30 @@
       </div>
 
       <div class="card">
+        <h2>Optional skills</h2>
+        <p class="note">Extra Claude Code skills that ship with this extension but aren't about
+          story tracking — install only the ones you actually want. Unlike the skill above, these
+          aren't bound to any project; "This project only" just controls where the files land.</p>
+
+        <div class="field-row">
+          <label for="extraSkillSelect">Skill</label>
+          <select class="f-mode" id="extraSkillSelect">
+            <option value="nextjs-project-architecture">nextjs-project-architecture — Next.js App Router structure, data fetching, forms/tables, auth</option>
+            <option value="shadcn-from-mantine">shadcn-from-mantine — shadcn/ui explained for Mantine developers: owned source, Tailwind + CSS-variable theming</option>
+          </select>
+        </div>
+        <div class="field-row">
+          <label for="extraSkillScope">Install to</label>
+          <select class="f-mode" id="extraSkillScope">
+            <option value="user">Every project (%USERPROFILE%\.claude\skills\)</option>
+            <option value="project">This project only (&lt;root&gt;\.claude\skills\)</option>
+          </select>
+          <button class="ghost" id="extraSkillInstallBtn">Install</button>
+        </div>
+        <div id="extraSkillStatus" class="note"></div>
+      </div>
+
+      <div class="card">
         <h2>Rules source</h2>
         <div class="source" id="source">…</div>
       </div>

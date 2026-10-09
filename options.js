@@ -259,6 +259,28 @@ async function copyRenderedSkill(msgEl) {
 $('#agentCopyAgentsBtn').onclick = () => copyRenderedSkill($('#agentCopyMsg'));
 $('#agentCopyInstructionsBtn').onclick = () => copyRenderedSkill($('#agentCopyMsg'));
 
+// ---------- Optional skills (generic - not bound to the active project) ----------
+// Same installSkill message/installskill host action as the Agent integration card above, just
+// with an explicit msg.skill naming a generic skill (nextjs-project-architecture and
+// shadcn-from-mantine today; add more <option>s here as more ship in skills\) instead of riding
+// the default ('story-tab-groups'). No
+// render-first step needed here the way the card above has one (that one shows devCycleDetected
+// before you commit to installing) - a generic skill has no per-project content to preview, so
+// there's nothing that render would show you that the skill's own description doesn't already.
+$('#extraSkillInstallBtn').onclick = async () => {
+  const skill = $('#extraSkillSelect').value;
+  const scope = $('#extraSkillScope').value;
+  setMsg($('#extraSkillStatus'), 'Installing…');
+  let res;
+  try { res = await send({ type: 'installSkill', install: true, scope, skill }); } catch (e) { res = { ok: false, error: String(e) }; }
+  if (res && res.ok) {
+    $('#extraSkillStatus').innerHTML = `<span class="pill gen">✓ installed</span> <span class="note">${esc(res.path || '')}</span>`;
+  } else {
+    const hint = res && res.nativeHostMissing ? ' — native host unreachable' : '';
+    setMsg($('#extraSkillStatus'), 'Error: ' + ((res && res.error) || 'unknown') + hint, 'err');
+  }
+};
+
 // Every "Help" pointer on this page opens the same page, in a new tab — the full step-by-step
 // install/troubleshooting guide this page intentionally doesn't repeat inline.
 const openHelp = (e) => { e.preventDefault(); chrome.tabs.create({ url: chrome.runtime.getURL('help.html') }); };

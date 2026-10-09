@@ -404,12 +404,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         break;
       }
       case 'installSkill': {
-        // Settings' Agent integration card. install:true also writes the file (Claude Code);
-        // install:false (or omitted) only renders the content, for the Codex/ChatGPT copy
-        // buttons - one rendering path on the host side (install-agent-skill.ps1), reused by
-        // every consumer here too, so none of them can drift out of sync with each other.
+        // Settings' Agent integration card (story-tab-groups/setup-dev-loop) AND its Optional
+        // skills card (nextjs-project-architecture, shadcn-from-mantine - generic/non-project skills) share this one
+        // case - msg.skill picks which (background.js never defaults it; host.ps1's own
+        // 'installskill' action falls back to 'story-tab-groups' when omitted, so every existing
+        // caller that doesn't pass skill keeps working unchanged). install:true also writes the
+        // file/folder (the Install button); install:false (or omitted) only renders the content,
+        // for the Codex/ChatGPT copy buttons - one rendering path on the host side
+        // (install-agent-skill.ps1), reused by every consumer here too, so none of them can drift
+        // out of sync with each other.
         try {
-          const res = await sendHost('installskill', { scope: msg.scope, install: msg.install });
+          const res = await sendHost('installskill', { scope: msg.scope, install: msg.install, skill: msg.skill });
           sendResponse(res || { ok: false, error: 'native host gave no response' });
         } catch (e) {
           sendResponse({ ok: false, nativeHostMissing: true, error: (e && e.message) ? e.message : String(e) });

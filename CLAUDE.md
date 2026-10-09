@@ -59,6 +59,8 @@ works — see [Standalone / portability](#standalone--portability) below.
 | `tools/` | **Every PowerShell script this extension needs, in one folder** — see [Standalone / portability](#standalone--portability). |
 | `skills/story-tab-groups/SKILL.md` | The day-to-day agent skill source, a template (`{{PROJECT_ID}}`/`{{PROJECT_ROOT}}`/`{{TOOLS_DIR}}` placeholders, plus mode-aware `<!-- MODE:tracking -->`/`<!-- MODE:worktree -->` blocks) rendered/installed by `tools\install-agent-skill.ps1 -Skill story-tab-groups` (the default) — see [Agent skill](#agent-skill-claude-code--codex--chatgpt). |
 | `skills/setup-dev-loop/SKILL.md` | The separate **one-time bootstrap** skill template, rendered/installed the same way via `-Skill setup-dev-loop` — see [main_workspace / dev_workspace](#-main_workspace--dev_workspace--planning-discipline). |
+| `skills/nextjs-project-architecture/` | A **generic** (non-project, non-templated) skill — SKILL.md + `references/` + `assets/templates/` — installed via Settings' separate **Optional skills** card, not the Agent integration one. See [Agent skill](#agent-skill-claude-code--codex--chatgpt). |
+| `skills/shadcn-from-mantine/` | A second **generic** skill — SKILL.md + one `references/translation-table.md` — a conceptual shadcn/ui primer anchored purely in Mantine vocabulary (ownership model, Tailwind + CSS-variable theming, `cva` variants); deliberately defers all CLI/registry/`components.json` mechanics to shadcn's own official MCP server rather than duplicating them. Installed via the same **Optional skills** card. See [Agent skill](#agent-skill-claude-code--codex--chatgpt). |
 | `setup.ps1` | One-command bootstrap: installs + verifies the native host end-to-end, finds/asks for the data root, publishes `STG_ROOT`/`STG_TOOLS` env vars, runs a preflight, and (given `-OldExtensionDir`) migrates a prior non-standalone install. `-WhatIf` previews every change without touching anything. |
 
 ## Data flow (stories.json → groups)
@@ -394,12 +396,45 @@ phase, mark released — instead of a human handing it each command by hand. One
   unconditionally said "this project tracks stories, it doesn't cut git worktrees," even when rendered for
   a worktree-mode project (confirmed live against the real, already-installed `workouttrackerapp` skill —
   re-installing it after this fix now correctly reads "cuts a real git worktree per app").
-- **`native-host\host.ps1`'s `installskill` action**: `$msg.scope` validated against an allow-list
-  (`user`/`project`) before being forwarded, `$msg.install` picks `render`/`install`. Root-independent (no
+- **`native-host\host.ps1`'s `installskill` action**: `$msg.scope`/`$msg.skill` each validated against an
+  allow-list before being forwarded, `$msg.install` picks `render`/`install`. Root-independent (no
   `Test-RootReady`) — rendering needs a *resolved project* to bake into the template, not a live
   "does this root's data currently check out" gate. Always resolves to the **active** project (no
   `-Project`/`id` override reachable from the UI — this card, like Paths & diagnostics, has no
   "editing a non-active project" concept).
+- **Optional skills (generic, non-project skills)** — Settings has a *second*, separate card below Agent
+  integration for installing a skill that has nothing to do with story tracking (today:
+  `nextjs-project-architecture`, a Next.js App Router architecture skill, and `shadcn-from-mantine`, a
+  conceptual shadcn/ui-for-Mantine-developers bridge that points at shadcn's own MCP server for anything
+  mechanical instead of teaching CLI syntax that would go stale). It deliberately isn't folded into
+  the Agent integration card above: that card's whole framing ("teaches an agent to drive the active
+  project's story registry") and its `devCycleDetected` status line are specific to the story-tracking
+  skill and don't apply to a generic one, and a generic skill has no per-project render step worth
+  showing before you commit to installing (there's nothing a preview would tell you that the skill's own
+  one-line description in the dropdown doesn't already). `tools\install-agent-skill.ps1` treats a skill
+  named in its own `$GenericSkills` array (and added to the `-Skill` `[ValidateSet]` alongside it)
+  differently from a project skill: no `{{...}}` substitution, no mode-block stripping — the rendered
+  `content` is just SKILL.md's own text verbatim — and `install` copies the skill's **whole folder**
+  (`SKILL.md` + `references\` + `assets\`, whatever it has), not just one file, removing a stale prior copy
+  first so a version that dropped a file doesn't leave it behind forever. `-Project` stays mandatory for a
+  uniform call shape across both skill kinds even though a generic skill's content never uses it — it's
+  only consulted to resolve a `project`-scope destination root, and every real caller already has an active
+  project in context via `host.ps1`'s `$PathsInfo` regardless. Adding a future generic skill is: drop its
+  folder under `skills\<name>\`, add `<name>` to both `$GenericSkills` and the `-Skill` ValidateSet in
+  `install-agent-skill.ps1`, add `<name>` to `host.ps1`'s own `installskill` allow-list, and add an
+  `<option>` to Settings' `#extraSkillSelect` — four small, symmetric edits, not a new code path.
+  **Copy-Item gotcha caught while building this** (see Dev gotchas below for the full mechanism):
+  `-LiteralPath` with a trailing `\*` does not expand as a wildcard and silently copies nothing, with no
+  error even under `-ErrorAction Stop` — the fix copies the skill folder itself (already named `$Skill`)
+  into its destination's *parent*, never into an already-created, empty destination directory. Verified
+  live both ways: direct script invocation (`render`/`install` to both scopes) and the real framed
+  native-messaging protocol (a hand-built length-prefixed JSON frame piped to `host.ps1`, the same
+  mechanism `background.js`/`chrome.runtime.sendNativeMessage` actually uses) — including confirming the
+  existing `story-tab-groups`/`setup-dev-loop` project-skill path is byte-for-byte unaffected by any of
+  this branching. Repeated identically for `shadcn-from-mantine` when it was added (full folder copy
+  verified by hash against the source, stale-file removal re-confirmed, host.ps1's own allow-list
+  re-confirmed as the thing rejecting an unknown `-Skill` rather than the PS script's ValidateSet alone)
+  — the four-edit pattern held with no code-path changes.
 - **Every command the skill teaches bakes in `-Project {{PROJECT_ID}}` explicitly** — confirmed necessary
   by reading `Resolve-StgPaths`: with no `-Project`, these scripts fall back to whichever project is
   currently active in the *popup*, which the skill must never silently ride along with.
@@ -934,6 +969,22 @@ it works — no hand-editing, no second folder full of scripts, no other machine
 
 ## Dev gotchas (these cost real debugging time)
 
+- **`Copy-Item -LiteralPath` with a trailing `\*` does not expand it as a wildcard — and silently
+  copies nothing, with no error, even under `-ErrorAction Stop`.** Wildcard expansion (`a\*` meaning
+  "everything in `a`") is `-Path`'s behavior; `-LiteralPath` exists specifically to turn that off, so
+  it looks for a file literally named `*`, finds none, and — confirmed live, isolated in a scratch
+  folder — the whole `Copy-Item` call is just a silent no-op rather than a thrown "path not found."
+  This hit `install-agent-skill.ps1`'s first draft of copying a generic (non-templated) skill's whole
+  folder tree: `Copy-Item -LiteralPath (Join-Path $skillDir '*') -Destination $destDir -Recurse -Force`
+  against an already-created empty `$destDir` reported `ok:true, installed:true` with a
+  perfectly plausible-looking path, while the destination folder stayed completely empty — the kind
+  of bug that announces nothing is wrong unless you actually `Get-ChildItem` the result. **Fix: don't
+  create the destination first and try to copy *into* it — copy the SOURCE folder itself (which
+  already carries the right leaf name) into the destination's *parent* instead**
+  (`Copy-Item -LiteralPath $skillDir -Destination $destParent -Recurse -Force`, after removing any
+  stale `$destDir` so a version that dropped a file doesn't leave it behind) — no wildcard needed at
+  all. See [Agent skill](#agent-skill-claude-code--codex--chatgpt)'s Optional skills entry for the
+  full context this was caught in.
 - **MV3 service worker goes stale on `⟳` reload.** Editing `background.js` and clicking the card's
   ⟳ often keeps the *old* worker warm — symptom: the popup is new but messages fall through to the
   `default:` case (e.g. a remove returns `error:"unknown"`). **Fix: toggle the extension Off then

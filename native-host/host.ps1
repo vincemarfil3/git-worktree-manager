@@ -411,17 +411,25 @@ try {
       } catch { Reply @{ ok = $false; error = $_.Exception.Message } }
     }
     'installskill' {
-      # Settings' Agent integration card - renders (and, for the Claude Code button, installs)
-      # the story-tab-groups skill for the resolved project. Root-independent (no Test-RootReady):
-      # rendering needs a resolved PROJECT (root/tools-dir to bake into the template), not a live
-      # "does this root's data currently check out" gate the way a story-mutating action would.
-      # $msg.scope validated against an allow-list before being forwarded - same posture as
-      # setappmap's host-computed destination and storydoc's docAction validation, never a path or
-      # action string trusted wholesale from the caller.
+      # Settings' Agent integration card (story-tab-groups/setup-dev-loop, project-templated) AND
+      # its separate Optional skills card (nextjs-project-architecture, shadcn-from-mantine, and any
+      # future generic, non-project skill) both land here - renders (and, for the Install button,
+      # installs) the requested skill for the resolved project. Root-independent (no Test-RootReady): rendering
+      # needs a resolved PROJECT (root/tools-dir to bake into a template, or just a destination
+      # root for a generic skill's project-scope install), not a live "does this root's data
+      # currently check out" gate the way a story-mutating action would.
+      # $msg.scope/$msg.skill each validated against an allow-list before being forwarded - same
+      # posture as setappmap's host-computed destination and storydoc's docAction validation,
+      # never a path or action string trusted wholesale from the caller (install-agent-skill.ps1's
+      # own -Skill ValidateSet would also reject an unknown name, but failing fast here keeps the
+      # error message host-side and consistent with every other validated field in this switch).
       $scope = [string]$msg.scope
       if ($msg.install -eq $true -and $scope -notin @('user', 'project')) { Reply @{ ok = $false; error = "invalid scope: $scope" }; break }
+      $skill = [string]$msg.skill
+      if (-not $skill) { $skill = 'story-tab-groups' }
+      if ($skill -notin @('story-tab-groups', 'setup-dev-loop', 'nextjs-project-architecture', 'shadcn-from-mantine')) { Reply @{ ok = $false; error = "invalid skill: $skill" }; break }
       $action = if ($msg.install -eq $true) { 'install' } else { 'render' }
-      $sargs = @($action, '-Project', [string]$PathsInfo.ProjectId)
+      $sargs = @($action, '-Project', [string]$PathsInfo.ProjectId, '-Skill', $skill)
       if ($action -eq 'install') { $sargs += @('-Scope', $scope) }
       Invoke-StoryScript 'install-agent-skill.ps1' ($sargs + '-Json') 'installskill'
     }
